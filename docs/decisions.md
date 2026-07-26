@@ -487,3 +487,138 @@ Every claim above is grounded in one of these:
 - **Supabase MCP** — https://supabase.com/docs/guides/ai-tools/mcp
   and https://github.com/supabase/mcp.
 - **Claude Code MCP config** — Context7 id: `/websites/code_claude`.
+
+---
+
+# Phase 1 — Outcomes
+
+Snapshot date: 2026-07-26. Phase 1 shipped in commit `1f46185` on
+`matchday-agent` main. Full closing notes with runtime evidence live
+in the spec (`~/Dev/matchday-mcp/specs/004-langgraph-agent.md §
+Phase 1`); this section is the source of truth for the decisions that
+lock choices for Phase 2 onward.
+
+---
+
+## 1.1 — LLM default confirmed: Groq `llama-3.3-70b-versatile`
+
+Locked in `.env.example` and validated across the 5 anchor use cases:
+
+- Tool-calling: native, robust. Emits parallel tool calls in a single
+  assistant response when instructed to (see § 1.2).
+- Response shape: `AIMessage.content = str` (matches the response-shape
+  gotcha noted in § 0.1). The CLI's `_extract_chunk_text` handles both
+  Groq's `str` and Gemini 3.x's `list[dict]` shapes, so provider swap
+  via `LLM_PROVIDER=google_genai` remains zero-code.
+
+**Kimi K2 A/B deferred to Phase 4** (LangSmith evals). Bench inside
+this repo is a stretch; the free tier of `llama-3.3-70b-versatile` is
+adequate for v1 shipping.
+
+---
+
+## 1.2 — `SYSTEM_PROMPT` is a Phase 1 deliverable, not a later stretch
+
+**Empirical finding**: Groq `llama-3.3-70b-versatile` (and by
+extension, any model < ~200B params on similar training) does NOT
+reliably emit parallel tool calls or use complementary tools without
+explicit prompting. Discovered by running the 5 anchor cases against
+a minimal prompt — case #4 fetched only 2 of the 5 top leagues,
+failing the parallelization exercise the spec mandates.
+
+**Fix**: added three directives to `SYSTEM_PROMPT` in
+`src/matchday_agent/prompts/system.py`:
+
+1. **Parallel tool calls** — "when a question spans N entities or N
+   competitions, emit N tool calls in the SAME assistant response so
+   LangGraph runs them in parallel". Example given inline for the
+   5-leagues case.
+2. **Question → tools coverage guide** — maps common Spanish football
+   queries ("cómo llega X al clásico", "próximo partido de X",
+   "compará A vs B", "cuál liga está más disputada", "resumen del
+   fin de semana") to the exact tool combinations the model must
+   call, so it doesn't dismiss a question as unanswerable by using
+   only one tool.
+3. **Try-alternative-tools rule** — "if one tool returns empty or
+   errors, try a DIFFERENT tool that could cover the same
+   information before telling the user you cannot answer". Prevents
+   early surrender on `get_team_matches` when `get_matches` is the
+   actual fixture source.
+
+**Prompt language**: English (instructions). Response language:
+Spanish, neutral Latin American register, enforced in the prompt
+body. Full text in `src/matchday_agent/prompts/system.py`.
+
+**Rule of thumb for Phase 2+**: any behavior we expect from the
+agent must be either (a) explicit in the prompt, (b) demonstrated by
+a few-shot example in the prompt, or (c) a hard-coded guardrail in
+the graph. LangGraph itself does NOT enforce behavior — the LLM does
+what the prompt tells it, no more.
+
+---
+
+## 1.3 — `[tool.basedpyright] typeCheckingMode = "standard"`
+
+Locked in `pyproject.toml`. Rationale in the file's inline comment;
+short version: basedpyright's default `"recommended"` mode is a
+superset of pyright's `"standard"` with extra rules
+(`reportAny`, `reportExplicitAny`, `reportUnknownVariableType`,
+`reportUnknownMemberType`, `reportUnknownArgumentType`,
+`reportUnusedCallResult`, `reportImplicitStringConcatenation`,
+`reportDeprecated`, `reportMissingTypeStubs`) that fire ~50 times on
+the `langchain` / `langgraph` / `langchain-mcp-adapters` ecosystem
+because those libraries leak `Unknown` and `Any` through their
+public generics.
+
+Dropping to pyright's `"standard"` baseline still catches:
+
+- Missing imports.
+- Wrong argument types on OUR code.
+- Undeclared generic type arguments on OUR code (this is why we
+  type `checkpointer: BaseCheckpointSaver[Any]` and
+  `CompiledStateGraph[Any, Any, Any, Any]` in `graph.py`).
+- Deprecated symbols we import (informational).
+
+**Do NOT bump back to `"recommended"`** without a strategy for the
+ecosystem noise (stub packages for langchain/langgraph, or a long
+list of file-scoped `# pyright: ignore` directives — both worse than
+the current setup).
+
+---
+
+## 1.4 — RAG tool intentionally NOT stubbed in Phase 1
+
+The spec drafted "the 1 RAG tool (added in Phase 2; stubbed here)".
+Decision: **do not stub**. A tool advertised in the system prompt
+that returns nothing useful degrades tool-selection reasoning — the
+model tries it, gets nothing, and either gives up early or distrusts
+the whole tool set.
+
+**Contract preserved for Phase 2**: the RAG tool arrives via the
+same `create_react_agent(..., tools=[...])` binding site in
+`src/matchday_agent/graph.py`, no changes needed to `cli.py` or
+`tools/mcp_tools.py`. To ship it:
+
+1. Add `search_football_context(query, k=5)` as a LangChain
+   `BaseTool` (likely under `src/matchday_agent/tools/rag.py`).
+2. Append it to the `tools` list in `graph.py`.
+3. Add the corresponding paragraph to the coverage guide in the
+   system prompt so the model knows when to reach for it (rivalry,
+   history, "legendary" style questions).
+
+---
+
+## 1.5 — CLI streaming pattern shared with Phase 3 SSE
+
+The `mda` REPL's streaming implementation in `src/matchday_agent/cli.py`
+uses `agent.astream_events(..., version="v2")` and filters the same
+`on_chat_model_stream` + `on_tool_start` events that Phase 3's
+`EventSourceResponse` will consume (per § 0.5). This is deliberate:
+the REPL is not throwaway — it's the local mirror of the production
+SSE contract. When Phase 3 wires FastAPI, `_stream_turn`'s event
+handling code can be lifted almost verbatim into the event serializer,
+keeping the CLI and the web on the same behavior.
+
+**Do not diverge** the REPL's event handling from the SSE contract in
+Phase 3 — instead, extract the shared logic into a small utility if
+the shape between CLI-print and SSE-emit needs to fork.
