@@ -1,0 +1,68 @@
+[project]
+name = "matchday-agent"
+version = "0.1.0"
+description = "Football-analyst agent orchestrating MCP tools + Wikipedia RAG on top of the matchday-mcp server."
+license = { text = "MIT" }
+authors = [{ name = "Reinaldo Orozco" }]
+requires-python = ">=3.12"
+
+# Runtime dependencies — all pins validated in Phase 0 (see docs/decisions.md § 0.1).
+dependencies = [
+  # LangGraph core + Postgres checkpointer (uses psycopg 3 under the hood).
+  "langgraph==1.2.9",
+  "langgraph-checkpoint-postgres==3.1.0",
+  # LangChain runtime + provider adapters + LangSmith.
+  "langchain==1.3.14",
+  "langchain-core==1.5.1",
+  "langchain-groq==1.1.3",           # Primary provider (env LLM_PROVIDER=groq).
+  "langchain-google-genai==4.3.1",   # Fallback provider (env LLM_PROVIDER=google_genai).
+  "langsmith==0.10.10",
+  # MCP client — Python SDK + adapters to expose MCP tools as LangChain BaseTools.
+  "mcp>=1.28.1,<2",
+  "langchain-mcp-adapters==0.3.0",
+  # HTTP layer.
+  "fastapi==0.140.0",
+  "uvicorn[standard]==0.51.0",
+  "sse-starlette>=0.3.0",
+  "slowapi==0.1.10",
+  "httpx>=0.28.1",
+  # Postgres + pgvector — raw psycopg 3, no SQLAlchemy (see § 0.3).
+  "psycopg[binary,pool]==3.3.4",
+  "pgvector==0.5.0",
+  # RAG ingestion (Wikipedia).
+  "Wikipedia-API==0.15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.7",
+  "basedpyright>=1.20",
+]
+
+# CLI entry point for local end-to-end conversation testing (Phase 1).
+[project.scripts]
+mda = "matchday_agent.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/matchday_agent"]
+
+# uv-managed workspace.
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+build/
+dist/
+
+# uv
+.venv/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Fly.io
+.fly/
+
+# Local logs
+*.log
+
+# opencode / agent runtime state
+.omo/run-continuation/

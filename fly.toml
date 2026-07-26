@@ -1,0 +1,41 @@
+# fly.toml — Fly.io deploy config for matchday-agent.
+# Validated in Phase 0 (docs/decisions.md § 0.6). Applied by `fly deploy` in Phase 5.
+
+app = "matchday-agent"
+primary_region = "mia"  # Default. Alternatives: `iad` (Ashburn), `sea` (Seattle).
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  LOG_LEVEL = "info"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"    # Cost-safe: scale to zero when idle.
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  # KNOWN LIMITATION (docs/decisions.md § 0.6): idle SSE streams do NOT
+  # keep the machine awake. Fly Proxy scores load on inbound HTTP only.
+  # OK for v1 (anchor use cases complete in < 30 s).
+
+  [http_service.concurrency]
+    type = "requests"           # Modern default (deprecated: `connections`).
+    hard_limit = 20
+    soft_limit = 10
+
+  [[http_service.checks]]
+    grace_period = "15s"        # Room for Python cold-start.
+    interval = "30s"
+    method = "GET"
+    path = "/health"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"              # Bump to `1gb` if Node subprocess +
+                                # pgvector queries pressure it (revisit Phase 5).
