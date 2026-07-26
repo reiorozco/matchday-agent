@@ -29,6 +29,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from matchday_agent.graph import build_agent
 from matchday_agent.tools.mcp_tools import MissingCredentialError, matchday_mcp_tools
+from matchday_agent.tools.rag import search_football_context
 
 # ANSI dim/reset for tool-call annotations. Terminals without ANSI ignore.
 _DIM = "\x1b[2m"
@@ -168,11 +169,12 @@ async def _amain(args: argparse.Namespace) -> int:
         checkpointer = await stack.enter_async_context(AsyncPostgresSaver.from_conn_string(dsn))
         await checkpointer.setup()
         try:
-            tools = await stack.enter_async_context(matchday_mcp_tools())
+            mcp_tools = await stack.enter_async_context(matchday_mcp_tools())
         except MissingCredentialError as e:
             print(f"[startup] {e}", file=sys.stderr)
             return 2
-        print(f"[startup] loaded {len(tools)} MCP tools: {', '.join(t.name for t in tools)}\n")
+        tools = [*mcp_tools, search_football_context]
+        print(f"[startup] loaded {len(tools)} tools: {', '.join(t.name for t in tools)}\n")
         agent = build_agent(model=model, tools=tools, checkpointer=checkpointer)
         return await _repl(agent, session_id)
 

@@ -622,3 +622,203 @@ keeping the CLI and the web on the same behavior.
 **Do not diverge** the REPL's event handling from the SSE contract in
 Phase 3 — instead, extract the shared logic into a small utility if
 the shape between CLI-print and SSE-emit needs to fork.
+
+---
+
+# Phase 2 — Outcomes
+
+Snapshot date: 2026-07-26. Phase 2 shipped on `matchday-agent` main.
+Wikipedia RAG corpus lives in Supabase `public.documents` (2400 rows
+spanning 68 unique Wikipedia URLs — 50 EN + 18 ES). Full closing notes
+with runtime evidence live in the spec
+(`~/Dev/matchday-mcp/specs/004-langgraph-agent.md § Phase 2`); this
+section is the source of truth for the decisions that lock choices for
+Phase 3+.
+
+---
+
+## 2.1 — Embedder locked: `intfloat/multilingual-e5-large` via fastembed
+
+**Decision**: 1024-dim, MIT license, multilingual (~100 langs), local
+ONNX inference via `fastembed>=0.7.1`. No API keys, no rate limits, no
+billing risk. Cached at `~/.cache/fastembed/`; first-run download
+~2.24 GB.
+
+**Empirical pivot from the initial librarian recommendation**: the
+research pass recommended `BAAI/bge-m3` via fastembed. Runtime check
+(`TextEmbedding.list_supported_models()`) revealed BGE-M3 is NOT in
+fastembed's catalog — it requires the separate `FlagEmbedding` library
+because of its multi-vector modes. Pivoted to `multilingual-e5-large`,
+same 1024d, native to fastembed's qdrant-hosted catalog.
+
+**Chunk-size trade-off**: E5-large truncates at 512 tokens. With the
+"passage: " prefix (~2 tokens) injected by `fastembed.passage_embed`,
+we set the chunker to 480 tokens (see § 2.2) to leave headroom. Chunks
+larger than 480 would silently lose their tail after tokenization.
+
+**Fastembed 0.7 pooling warning**: startup emits a UserWarning
+suggesting to pin `fastembed==0.5.1` to preserve the "CLS embedding"
+pooling that older E5-large uses. Fastembed 0.7+ switched to mean
+pooling. **Ignored**: mean pooling is the current
+sentence-transformers default and works well in practice; the warning
+is cosmetic drift, not a correctness bug.
+
+**Query vs passage APIs** (from `src/matchday_agent/rag/embedder.py`):
+
+```python
+from fastembed import TextEmbedding
+
+model = TextEmbedding(model_name="intfloat/multilingual-e5-large")
+
+passage_vecs = list(model.passage_embed(texts, batch_size=32))
+query_vec = list(model.query_embed([query]))[0]
+```
+
+Fastembed injects the E5 required prefixes internally; never inject
+them manually.
+
+---
+
+## 2.2 — Ingestion pipeline
+
+**Library**: `Wikipedia-API==0.15.0` (already pinned from Phase 0).
+Kept over `langchain_community.WikipediaLoader` which is broken in
+2026 — it delegates to the unmaintained `goldsmith/Wikipedia` package
+that Wikimedia rate-limited due to a non-compliant User-Agent.
+
+**Sync-vs-async choice**: `wikipediaapi.AsyncWikipedia` exists in
+0.15.0 but the ingest script uses the sync `Wikipedia` class wrapped
+with `asyncio.to_thread`. Simpler, well-tested behavior; ingestion is
+a one-shot script where async ergonomics don't materially help.
+
+**User-Agent** (per Wikimedia Foundation policy, 2024+):
+
+```
+matchday-agent/0.1 (https://github.com/reiorozco/matchday-agent/issues) Wikipedia-API/0.15.0
+```
+
+GitHub issues URL alone (no email) is policy-compliant and doesn't
+leak private contact info.
+
+**Chunking** — locked in `scripts/ingest_wikipedia.py`:
+
+- `RecursiveCharacterTextSplitter.from_tiktoken_encoder(encoding_name="cl100k_base")`
+- `chunk_size=480 tokens` (NOT 512 — leaves headroom for E5's
+  "passage: " prefix inside the 512-token truncation limit)
+- `chunk_overlap=64 tokens` (~13%)
+
+Do NOT default to `len` as the length function — that measures
+characters, not tokens, and 480 chars is ~100-150 tokens (way too
+small). `from_tiktoken_encoder` swaps in the tiktoken byte-pair
+counter, which is what the 480/64 numbers are calibrated against.
+
+**Corpus (v1)**: 60 pages across EN + ES:
+
+- 20 LaLiga 2024-25 clubs (EN + ES)
+- 20 Premier League 2024-25 clubs (EN only)
+- 10 famous derbies + Champions League finals (EN only)
+
+Result: **2400 chunks** (~40 per page average). EN pass 1165 chunks,
+ES pass 1235 chunks (ES articles for big clubs like Real Madrid /
+Atlético Madrid tend to be longer than their EN counterparts).
+
+**One title mismatch**: `Athletic Bilbao` is missing on ES wiki
+(the page there is `Athletic Club`). Not blocking for v1; a future
+alias-fallback layer inside the ingester would fix it.
+
+---
+
+## 2.3 — Schema + migration path
+
+**Table**: `public.documents`, 11 columns, `embedding vector(1024)`.
+Full DDL in `db/schema.sql`.
+
+Key column decisions:
+
+- `section_title TEXT` (nullable, NOT populated in v1) — placeholder
+  for a Phase 4+ enhancement that chunks by Markdown headers instead
+  of flat text.
+- `revision_id BIGINT` (nullable, NOT populated in v1) —
+  Wikipedia-API 0.15.0 does not expose `revision_id` on the default
+  page object. Left in the schema for future incremental-update
+  workflows.
+- `UNIQUE (source_url, chunk_idx)` — enables the upsert path in
+  `rag/store.py::upsert_chunks` (`ON CONFLICT DO UPDATE`).
+
+**Indexes**:
+
+- `documents_pkey` (PK on id)
+- `documents_source_url_chunk_idx_key` (unique constraint index)
+- `idx_documents_embedding_hnsw` (HNSW cosine, pgvector ≥ 0.5.0)
+- `idx_documents_wiki_lang` (btree, for language filtering)
+
+**Migration application path pivot**: The plan called for
+`apply_migration` via the Supabase MCP. Runtime discovery: the MCP
+is configured `read_only=true` in `.mcp.json` (per § 0.7 safety
+default), so DDL is rejected. Pivoted to raw `psycopg` executed
+against the app's `DATABASE_URL` (session pooler, port 5432,
+`postgres.<REF>` role). The DDL is idempotent (`CREATE ... IF NOT
+EXISTS`) and can be re-run safely.
+
+**Do NOT** flip the MCP to `read_only=false` just to enable
+migrations — that would expose the entire Supabase project to any
+tool call the LLM decides to make. Keep the manual `psycopg`
+migration path.
+
+---
+
+## 2.4 — pgvector: `Vector()` wrap is REQUIRED for `<=>`, but NOT for INSERT
+
+**Bug discovered at first case #1 run**:
+
+```
+UndefinedFunction: operator does not exist: vector <=> double precision[]
+```
+
+**Cause**: `register_vector_async` (from § 0.3) lets psycopg infer
+the vector type when the target is a known `vector(...)` column —
+INSERT worked with a raw `list[float]`. But in a standalone
+comparison `embedding <=> %s`, the RHS is untyped; psycopg sends
+`list[float]` as PostgreSQL `double precision[]`, and Postgres cannot
+match that against the `<=>` operator overload (which is
+`vector <=> vector`).
+
+**Fix** (in `src/matchday_agent/rag/store.py::similar`):
+
+```python
+from pgvector import Vector
+
+vec = Vector(query_vec)  # explicit wrap
+await cur.execute(
+    "SELECT ... embedding <=> %s AS distance "
+    "... ORDER BY embedding <=> %s LIMIT %s",
+    (vec, vec, k),
+)
+```
+
+**Rule of thumb for Phase 3+**: any raw vector expression outside a
+direct column INSERT MUST wrap the operand with `Vector()`. INSERT
+into a `vector(N)` column does NOT need the wrap (Postgres knows the
+target type). This asymmetry is easy to miss.
+
+---
+
+## 2.5 — RAG tool wiring: compose at CLI, keep graph generic
+
+`src/matchday_agent/graph.py` accepts `tools: list[BaseTool]` as an
+opaque parameter — it does not know about MCP tools vs RAG tools vs
+future tools. Composition happens in `src/matchday_agent/cli.py`:
+
+```python
+mcp_tools = await stack.enter_async_context(matchday_mcp_tools())
+tools = [*mcp_tools, search_football_context]
+agent = build_agent(model=model, tools=tools, checkpointer=checkpointer)
+```
+
+This keeps `graph.py` reusable for tool-set variations without
+editing the graph builder — e.g. Phase 4 eval runs that swap tools,
+per-user gating, or a lite tool-set for cheaper inference.
+
+**For Phase 3** (FastAPI `lifespan`): apply the same append pattern
+in the `lifespan` handler. Do NOT push the composition into
+`graph.py`.

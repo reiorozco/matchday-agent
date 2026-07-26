@@ -31,6 +31,9 @@ dependencies = [
   "pgvector==0.5.0",
   # RAG ingestion (Wikipedia).
   "Wikipedia-API==0.15.0",
+  "fastembed>=0.7.1",
+  "langchain-text-splitters>=0.3",
+  "tiktoken>=0.7",
 ]
 
 [project.optional-dependencies]
