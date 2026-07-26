@@ -822,3 +822,172 @@ per-user gating, or a lite tool-set for cheaper inference.
 **For Phase 3** (FastAPI `lifespan`): apply the same append pattern
 in the `lifespan` handler. Do NOT push the composition into
 `graph.py`.
+
+---
+
+# Phase 3 — Outcomes
+
+Snapshot date: 2026-07-26. Phase 3 shipped on `matchday-agent` main.
+Public HTTP + SSE surface live via FastAPI + `sse-starlette` +
+`slowapi`. The 4 endpoints match the frozen contract in
+[`api-contract.md`](./api-contract.md). Full closing notes with
+runtime evidence live in the spec
+(`~/Dev/matchday-mcp/specs/004-langgraph-agent.md § Phase 3`); this
+section is the source of truth for the decisions that lock choices
+for Phase 4+.
+
+---
+
+## 3.1 — FastAPI `lifespan` mirrors the CLI's AsyncExitStack
+
+`src/matchday_agent/app.py`'s `lifespan` composes exactly the same
+resource stack as `cli.py::_amain`:
+
+1. `AsyncPostgresSaver.from_conn_string(DATABASE_URL)` +
+   `checkpointer.setup()` (idempotent).
+2. `matchday_mcp_tools()` (spawns `npx matchday-mcp` once, keeps
+   the MCP session persistent for the process lifetime — Option B
+   per § 0.2).
+3. Tool composition: `tools = [*mcp_tools, search_football_context]`.
+4. `agent = build_agent(model, tools, checkpointer)` — the compiled
+   ReAct graph.
+
+The compiled graph is stored on `app.state.agent` and shared across
+all requests. Per-request state isolation happens via the
+`X-Session-Id` header -> `thread_id` -> checkpointer.
+
+**Do NOT** move resource acquisition into per-request dependencies.
+Building the graph or spawning the MCP subprocess per request would
+add ~2-3 s of cold overhead on every call.
+
+---
+
+## 3.2 — SSE emitter maps LangGraph events to the frozen contract
+
+`src/matchday_agent/app.py::_sse_events` iterates
+`agent.astream_events(..., version="v2")` and maps each event kind
+to the frozen SSE contract (see `docs/api-contract.md`):
+
+| LangGraph event         | SSE `event:`    | `data:` shape                                                        |
+|-------------------------|-----------------|----------------------------------------------------------------------|
+| `on_chat_model_stream`  | `token`         | `{"text": <chunk text>}`                                             |
+| `on_tool_start`         | `tool_call`     | `{"tool", "input", "id"}` (id = LangGraph `run_id`)                  |
+| `on_tool_end`           | `tool_result`   | `{"id", "tool", "ok": true, "summary"}` (truncated to ~300 chars)    |
+| (accumulated at end)    | `final`         | `{"message": <full text>, "sources": []}`                            |
+| any exception           | `error`         | `{"code": <exception class name>, "message": str(exc)}`              |
+
+**Do NOT** diverge this mapping from the CLI's `_stream_turn` in
+`cli.py` (per § 1.5). Both surfaces normalize the SAME event kinds
+via the shared helpers in `src/matchday_agent/streaming.py`
+(`extract_chunk_text`, `format_tool_input`).
+
+---
+
+## 3.3 — `slowapi` rate limiter integration
+
+- `Limiter(key_func=get_remote_address)` keys by client IP.
+- `@limiter.limit("20/minute")` on both POST endpoints (`/chat` +
+  `/chat/stream`), unlimited on GET endpoints.
+- Exception handler registered via
+  `app.add_exception_handler(RateLimitExceeded, cast(Any, _rate_limit_exceeded_handler))`.
+  The `cast(Any, ...)` is required because slowapi's handler
+  signature `(Request, RateLimitExceeded) -> Response` is a
+  contravariant narrower subtype of what FastAPI's
+  `add_exception_handler` expects `(Request, Exception) -> Response`.
+  This is a legitimate type assertion, NOT a suppression — the
+  widening is safe because `add_exception_handler` dispatches by
+  exception class at runtime.
+
+In-memory backend (no Redis for v1). Note that the counter is
+process-local; multi-machine deployments (Phase 5 on Fly.io if we
+scale) would need a shared backend.
+
+---
+
+## 3.4 — `X-Session-Id` header validation
+
+Per the frozen contract, POST `/chat` and `/chat/stream` require a
+UUID v4 in the `X-Session-Id` header. `_validate_session_id` raises
+`HTTPException(400)` on missing or malformed values.
+
+The session_id feeds directly into the LangGraph `thread_id`
+(`config={"configurable": {"thread_id": session_id}}`), and
+`POST /chat` echoes it back in `ChatResponse.session_id` so clients
+can confirm the round-trip. Streaming responses do not echo it
+(the client already knows what it sent).
+
+---
+
+## 3.5 — Shared streaming helpers in `src/matchday_agent/streaming.py`
+
+Per the § 1.5 rule ("do not diverge the REPL's event handling from
+the SSE contract"), the two provider-agnostic helpers moved out of
+`cli.py` into `src/matchday_agent/streaming.py`:
+
+- `extract_chunk_text(chunk)` — normalizes `AIMessage.content`
+  across Groq (`str`) and Gemini 3.x (`list[dict]` with text +
+  reasoning parts).
+- `format_tool_input(tool_input)` — renders a tool_call input dict
+  as `k=v, k=v` for compact logging.
+
+Both `cli.py` and `app.py` import from this module. Any future
+change to provider content shapes is fixed in ONE place.
+
+---
+
+## 3.6 — Groq TPD limit + zero-code provider swap (empirical validation)
+
+During Phase 3 smoke testing, Groq's free-tier
+`llama-3.3-70b-versatile` hit the daily token-per-day (TPD) limit —
+99,335 of 100,000 tokens consumed across Phase 1, Phase 2, and
+early Phase 3 verifications combined. Near the cap, Groq's API
+returned malformed tool-call responses
+(`failed_generation`: `<function=get_standings {"competition": "PD"}></function>`
+text-form instead of structured `tool_calls[]`), triggering
+`groq.BadRequestError: tool_use_failed`.
+
+**Escape hatch validated**: swapped `LLM_PROVIDER=google_genai` +
+`LLM_MODEL=gemini-3.5-flash` in `.env`, restarted uvicorn, re-ran
+smoke tests. **Zero code changes**. All 4 endpoints + all SSE
+event kinds worked cleanly with Gemini. Reverted `.env` back to
+Groq afterwards (Groq is the primary per § 0.1).
+
+This empirically validates the § 0.1 promise that
+`init_chat_model(f"{provider}:{model}")` makes provider swap free.
+Also validates that `extract_chunk_text` correctly handles both
+Groq's `str` and Gemini's `list[dict]` content shapes at the same
+call sites (streaming + non-streaming).
+
+**Rule of thumb for Phase 5 deploy**: if Groq's daily TPD becomes
+pressured under real traffic, either upgrade to Groq's paid tier
+or flip `LLM_PROVIDER=google_genai` in `fly secrets set`. Both
+providers work behind the same `init_chat_model` interface.
+
+---
+
+## 3.7 — v1 fields intentionally left simple
+
+Per the closing notes in [`docs/api-contract.md`](./api-contract.md),
+several fields in the SSE contract and response bodies are
+v1-empty with a "reserved for Phase 4+" note:
+
+- `sources: []` (both `ChatResponse` and `event: final`) — Phase 4
+  will populate with structured cited-source entries during eval /
+  citation-tracking work.
+- `event: tool_result.ok` is always `true` in v1 — tool errors
+  surface via `event: error` and terminate the stream. Phase 4+
+  will let `ok=false` signal recoverable per-tool failures.
+- `event: error.code` is the Python exception class name —
+  structured codes (`upstream_llm_timeout`, `rate_limit_exceeded`)
+  paired with `retry_after` are Phase 4+.
+- `event: ping` is reserved but not emitted — anchor cases complete
+  under 30 s and don't need keep-alives. Documented so consumers
+  can start ignoring unknown events immediately.
+- `usage.{prompt_tokens, completion_tokens, total_tokens}` — the
+  LangChain provider adapters don't currently surface token counts
+  on `ainvoke`. Phase 4 will hook `on_llm_end` events to extract
+  them.
+
+The frozen contract's SHAPE is future-proof; only the CONTENT is
+minimally populated. Consumers written today will not break when
+Phase 4 fills in these fields.

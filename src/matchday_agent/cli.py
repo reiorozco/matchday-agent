@@ -28,6 +28,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from matchday_agent.graph import build_agent
+from matchday_agent.streaming import extract_chunk_text, format_tool_input
 from matchday_agent.tools.mcp_tools import MissingCredentialError, matchday_mcp_tools
 from matchday_agent.tools.rag import search_football_context
 
@@ -75,33 +76,6 @@ def _resolve_model_id(cli_provider: str | None, cli_model: str | None) -> str:
     return f"{provider}:{model}"
 
 
-def _extract_chunk_text(chunk: Any) -> str:
-    """Normalize AIMessageChunk.content across providers.
-
-    - Groq -> `str`
-    - Gemini 3.x -> `list[dict]` where text parts carry a "text" key and
-      reasoning parts do not.
-    """
-    content = getattr(chunk, "content", None)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict):
-                text = part.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "".join(parts)
-    return ""
-
-
-def _format_tool_input(tool_input: Any) -> str:
-    if isinstance(tool_input, dict):
-        return ", ".join(f"{k}={v!r}" for k, v in tool_input.items())
-    return str(tool_input)
-
-
 async def _stream_turn(agent: Any, user_input: str, session_id: str) -> None:
     """Stream a single conversational turn to stdout using astream_events(v2)."""
     config: dict[str, Any] = {"configurable": {"thread_id": session_id}}
@@ -114,7 +88,7 @@ async def _stream_turn(agent: Any, user_input: str, session_id: str) -> None:
         kind = event.get("event")
         if kind == "on_chat_model_stream":
             chunk = event.get("data", {}).get("chunk")
-            text = _extract_chunk_text(chunk)
+            text = extract_chunk_text(chunk)
             if text:
                 print(text, end="", flush=True)
                 printed_any_token = True
@@ -123,7 +97,7 @@ async def _stream_turn(agent: Any, user_input: str, session_id: str) -> None:
             tool_input = event.get("data", {}).get("input", {})
             prefix = "\n" if printed_any_token else ""
             print(
-                f"{prefix}{_DIM}[tool: {tool_name}({_format_tool_input(tool_input)})]{_RESET}",
+                f"{prefix}{_DIM}[tool: {tool_name}({format_tool_input(tool_input)})]{_RESET}",
                 flush=True,
             )
             printed_any_token = False
