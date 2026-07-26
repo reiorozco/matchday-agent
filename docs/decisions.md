@@ -1527,3 +1527,135 @@ health-check interval (`60s` or `120s` reduces probe density on Fly's
 side but does not affect auto-stop timing), or set an explicit
 `services.processes.stop_wait_timeout` in `fly.toml`.
 
+---
+
+# Phase 6 — Outcomes
+
+Snapshot date: 2026-07-26. Phase 6 shipped: public GitHub repo
+[reiorozco/matchday-agent](https://github.com/reiorozco/matchday-agent)
+created (8 commits, main pushed), `README.md` landing page written,
+`/openapi.json` reachable and linked, and handoff issue
+[matchday-mcp-web#1](https://github.com/reiorozco/matchday-mcp-web/issues/1)
+filed as the seed of the web-side spec. Full closing notes with
+runtime evidence live in the spec (`~/Dev/matchday-mcp/specs/004-langgraph-agent.md § Phase 6`); this
+section is the source of truth for the decisions.
+
+---
+
+## 6.1 — README structure (locked)
+
+`README.md` at repo root, ~200 lines. Design goals:
+
+- **Portfolio-quality**, not a manual. Reader forms an opinion in the
+  first screen.
+- **Every doc single-sourced** — README links to `docs/api-contract.md`
+  (SSE contract), `docs/decisions.md` (~1 600 lines of "why"),
+  `evals/baseline.md`, `.env.example`. It NEVER duplicates them.
+- **Copy-paste curl commands work against live URL** on first read
+  — no local setup needed to see the agent respond.
+- **Local quickstart shows three paths**: CLI REPL (`mda`), HTTP
+  server (`uvicorn`), Docker (`docker build && docker run`). Reader
+  picks the one that matches their workflow.
+
+Sections in order (locked): title + one-liner + live URL / OpenAPI /
+license badge · Live demo (60 s copy-paste) · What's inside · Anchor
+use cases · Endpoints (table + link to contract) · Local quickstart
+(3 paths + evals runner) · Configuration (critical env table + link to
+`.env.example`) · Architecture (ASCII diagram) · Observability · Evals
+· Deploy · Related repos · License.
+
+**Open TODO** (Phase 6 wanted, not blocking):
+
+- LangSmith trace screenshot at `docs/screenshots/langsmith-trace.png`.
+  Requires either a public shareable trace URL (LangSmith project is
+  currently team-scoped) or a manually curated screenshot. Marked TODO
+  in the README's Observability section.
+
+## 6.2 — GitHub repo: `reiorozco/matchday-agent`, public
+
+Created 2026-07-26 with:
+
+```bash
+gh repo create reiorozco/matchday-agent \
+  --public \
+  --description "Football-analyst agent (...)" \
+  --homepage "https://matchday-agent.fly.dev" \
+  --source . --push --remote origin
+```
+
+All 8 commits pushed (Phase 0 through Phase 5). `origin/main` set as
+upstream. Pre-push audit (`docs/decisions.md § 6.4`) confirmed no
+secrets in history.
+
+**Convention alignment** with sister repos (both already public):
+
+- [`reiorozco/matchday-mcp`](https://github.com/reiorozco/matchday-mcp)
+  — npm package + GitHub source (upstream for the 6 tools bound by
+  this agent).
+- [`reiorozco/matchday-mcp-web`](https://github.com/reiorozco/matchday-mcp-web)
+  — Svelte 5 frontend + Vercel deploy + GitHub source (downstream
+  consumer of this agent's SSE contract).
+
+## 6.3 — Handoff issue: `matchday-mcp-web#1`
+
+Filed at
+<https://github.com/reiorozco/matchday-mcp-web/issues/1>. Title:
+`Consume matchday-agent chat endpoint`. Content:
+
+- Full SSE contract table (all 5 `event:` kinds with field shapes).
+- Sample Svelte 5 runes-friendly consumption code (~50 LOC, working).
+- Session semantics (X-Session-Id + localStorage), rate limit, CORS
+  notes.
+- Cold-start UX consideration (skeleton state during first ~20 s).
+- Definition-of-done checklist (6 items).
+- Refs to live URL, OpenAPI schema, contract, README, decisions.md,
+  and the MCP upstream repo.
+
+The issue is designed to be **self-sufficient** — a contributor with
+Svelte 5 experience can implement without follow-up questions.
+Delivered against the Phase 6 spec exit criterion: "reader who has
+never seen this repo can go from README to a working curl against the
+live URL in under 5 minutes" — met via the `Live demo (60 s
+copy-paste)` section at the top of the README.
+
+## 6.4 — Pre-push secret audit (rule of thumb, not a decision)
+
+Before every first push of a repo to a public remote, run:
+
+```bash
+# Confirm .env is git-ignored AND not tracked.
+git ls-files | grep -iE "^\.env$|\.env\.[^.]+$" | grep -v ".env.example"
+
+# Sweep history for long-form values on common secret env names.
+git log --all --full-history --pretty=format: -p 2>&1 \
+  | grep -E "^\+.*_(KEY|TOKEN|URL|SECRET|PASSWORD)=[A-Za-z0-9]{15,}" \
+  | head -10
+```
+
+For this repo the sweep found 0 matches. Two shorter matches were false
+positives — both were literal `...` placeholders inside markdown code
+blocks in `docs/decisions.md` (`LANGSMITH_API_KEY=ls_...` +
+`export FOOTBALL_DATA_TOKEN=...`).
+
+**Rule of thumb**: run this sweep before any FIRST `git push` to a
+public remote. Once in the history, a real secret is permanently
+compromised regardless of subsequent removal (GitHub's fork network +
+crawlers).
+
+## 6.5 — `/openapi.json` is the machine-readable single source of truth
+
+FastAPI auto-generates OpenAPI 3.1 schema at `/openapi.json` from the
+Pydantic request/response models in `app.py`. Verified live:
+`HTTP 200 · 2 939 B · 4 documented paths (/, /chat, /chat/stream,
+/health)` (the `/openapi.json` endpoint itself is not listed inside
+its own schema).
+
+The README links `/openapi.json` prominently in the header badge line
+and again in the endpoints table. Downstream consumers (matchday-mcp-web
+per issue #1, or any future third-party) can codegen a typed client
+from this schema without touching Python source.
+
+**Do NOT** hand-maintain a duplicate OpenAPI spec file. The Pydantic
+models in `app.py` (`ChatRequest`, `ChatResponse`, `RootResponse`,
+`HealthResponse`) are the source; `/openapi.json` is the projection.
+
