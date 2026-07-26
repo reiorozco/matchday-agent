@@ -1,41 +1,56 @@
 # fly.toml — Fly.io deploy config for matchday-agent.
-# Validated in Phase 0 (docs/decisions.md § 0.6). Applied by `fly deploy` in Phase 5.
+# Created via `fly launch --no-deploy` on 2026-07-26 (Phase 5), starting
+# from the Phase 0 draft. Full rationale in docs/decisions.md § 0.6 + § 5.x.
 
-app = "matchday-agent"
-primary_region = "mia"  # Default. Alternatives: `iad` (Ashburn), `sea` (Seattle).
+app = 'matchday-agent'
+
+# Phase 5 choice: `iad` (Ashburn, VA). Supabase Postgres lives in
+# `ca-central-1` (Montreal). `iad` is ~1000 km from Montreal vs. ~2500 km
+# for `mia` — cuts checkpointer + pgvector RTT roughly in half. `iad` is
+# also close to Vercel's edge for the `matchday-mcp-web` frontend.
+primary_region = 'iad'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  PORT = "8080"
-  LOG_LEVEL = "info"
+  # Non-secret runtime config. Secrets live in `fly secrets set` (see
+  # docs/decisions.md § 0.6 for the 6-secret table).
+  PORT = '8080'
+  LOG_LEVEL = 'info'
+  # LangSmith auto-instrumentation requires this alongside LANGSMITH_API_KEY
+  # (which is a secret). See docs/decisions.md § 0.9.
+  LANGSMITH_TRACING = 'true'
+  # Explicit LLM defaults so a provider swap is a one-line fly.toml edit
+  # (or a `fly secrets set` override) + redeploy — no code change per § 3.6.
+  LLM_PROVIDER = 'groq'
+  LLM_MODEL = 'llama-3.3-70b-versatile'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"    # Cost-safe: scale to zero when idle.
+  auto_stop_machines = 'stop'     # Cost-safe: scale to zero when idle.
   auto_start_machines = true
   min_machines_running = 0
-  processes = ["app"]
+  processes = ['app']
 
   # KNOWN LIMITATION (docs/decisions.md § 0.6): idle SSE streams do NOT
   # keep the machine awake. Fly Proxy scores load on inbound HTTP only.
   # OK for v1 (anchor use cases complete in < 30 s).
 
   [http_service.concurrency]
-    type = "requests"           # Modern default (deprecated: `connections`).
+    type = 'requests'             # Modern default (deprecated: `connections`).
     hard_limit = 20
     soft_limit = 10
 
   [[http_service.checks]]
-    grace_period = "15s"        # Room for Python cold-start.
-    interval = "30s"
-    method = "GET"
-    path = "/health"
-    timeout = "5s"
+    grace_period = '15s'          # Room for Python cold-start.
+    interval = '30s'
+    method = 'GET'
+    path = '/health'
+    timeout = '5s'
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "512mb"              # Bump to `1gb` if Node subprocess +
-                                # pgvector queries pressure it (revisit Phase 5).
+  size = 'shared-cpu-1x'
+  memory = '512mb'                # Bump to `1gb` if Node subprocess +
+                                  # pgvector queries pressure it (revisit Phase 5).

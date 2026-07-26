@@ -1,0 +1,43 @@
+# Version control
+.git/
+.gitignore
+
+# Python caches + local virtualenv
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets — NEVER copy .env into images. .env.example is safe (no values).
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Local agent / MCP config (Claude Code, dev-only)
+.claude/
+.agents/
+.omo/
+.mcp.json
+skills-lock.json
+
+# Docs, evals, dev scripts, DDL — not needed in the runtime image.
+# Evals runner runs locally; ingest runs locally; DDL is already applied.
+docs/
+evals/
+scripts/
+db/
+
+# Deploy artifacts (avoid recursive copy into build context)
+Dockerfile
+.dockerignore
+fly.toml

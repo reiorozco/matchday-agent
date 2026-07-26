@@ -1164,3 +1164,366 @@ mid-season, top scorers shuffle), the reference summaries need
 manual refresh. Acceptable at portfolio-scale (~15 min of editing
 per season) and prevents the false-positive drift a self-baseline
 would silently absorb.
+
+---
+
+# Phase 5 — Outcomes
+
+Snapshot date: 2026-07-26. Phase 5 shipped on `matchday-agent` main.
+Live at https://matchday-agent.fly.dev on Fly.io (region `iad`,
+`shared-cpu-1x` / 512MB, `auto_stop_machines = 'stop'`,
+`min_machines_running = 0`). App name `matchday-agent` under org
+`rei-orozco`. Full closing notes with runtime evidence live in the spec
+(`~/Dev/matchday-mcp/specs/004-langgraph-agent.md § Phase 5`); this
+section is the source of truth for the decisions that lock choices for
+Phase 6+.
+
+---
+
+## 5.1 — Region: `iad` (Ashburn, VA), not `mia`
+
+Phase 0 draft (§ 0.6) defaulted to `mia`. Phase 5 chose `iad`. Rationale:
+
+- Supabase Postgres lives in `ca-central-1` (Montreal). Great-circle
+  distance: `iad` ≈ 1000 km, `mia` ≈ 2500 km. Cuts every checkpointer
+  round-trip + pgvector query RTT roughly in half.
+- `iad` is also close to Vercel's edge network for the
+  `matchday-mcp-web` frontend and to the Fly.io backbone in the US East.
+- Cost identical (Fly bills by machine-hour, not by region).
+
+Rejected: `mia` (draft default; worse DB latency); `yyz` Toronto (best
+DB latency but further from US traffic center); `sea` (unrelated to
+either DB or frontend edge).
+
+Documented in `fly.toml` inline comment.
+
+---
+
+## 5.2 — Cold start ≈ 20 s, not the spec's < 8 s target
+
+Empirical measurement (2026-07-26, first `/health` request after
+`fly deploy` completed with machine in `stopped` state):
+
+```
+HTTP 200 · connect=0.096s · ttfb=20.786s · total=20.786s
+```
+
+Breakdown estimated from container logs (all times relative to Firecracker start):
+
+| Phase                                                        | ~Duration |
+|--------------------------------------------------------------|-----------|
+| Firecracker boot + init                                      | ~2 s      |
+| Python interpreter + heavy imports (langchain, langgraph, pgvector, fastembed, psycopg) | ~6-8 s |
+| Lifespan setup: `AsyncPostgresSaver.setup()` + `matchday_mcp_tools()` (spawn `npx matchday-mcp`) + `build_agent()` | ~8-10 s |
+| Uvicorn ready + first request response                       | ~1 s      |
+
+Spec § Phase 5 target was `< 8 s (acceptable for demo)`. Observed is
+2.5x over. Acceptable per the spec's own qualifier — this is a
+portfolio demo, not a customer-facing SLA. Warm request (subsequent
+`GET /`): 0.41s.
+
+**Phase 6+ mitigation options** (NOT v1):
+
+- **Pre-import at build time**: `RUN python -c "import matchday_agent.app"` at
+  end of Dockerfile. Warms the bytecode cache but does not run lifespan.
+  Marginal gain (~1-2 s).
+- **`min_machines_running = 1`**: eliminates cold starts entirely.
+  Always-on cost (~$2-3/mo on shared-cpu-1x). Reasonable trade for a
+  demo shown to reviewers frequently.
+- **`performance-1x` VM class**: faster CPU, ~2x faster boot. ~2x cost.
+- **Parallelize lifespan startup**: `asyncio.gather(checkpointer.setup(),
+  matchday_mcp_tools().aenter())`. ~3-5 s reduction. Real refactor
+  in `app.py` but backwards-compatible.
+
+---
+
+## 5.3 — Dockerfile required 4 iterative fixes beyond the Phase 0 draft
+
+The Phase 0 draft (`§ 0.6`) was syntactically correct but had 4 real
+bugs that only surfaced at `fly deploy` time. Each is documented inline
+in the current `Dockerfile`. Fix history:
+
+### 5.3.1 — Missing `.dockerignore` (created new file)
+
+Without exclusions, `COPY --chown=appuser:appuser . .` copies:
+
+- `.env` — **SECRET LEAK into the image**.
+- `.venv/` — ~500 MB image bloat.
+- `.git/`, `.claude/`, `.agents/`, `.omo/` — dev config leaked.
+- `docs/`, `evals/`, `scripts/`, `db/` — non-runtime artifacts.
+
+Created `.dockerignore` at repo root with explicit exclusion of
+secrets, caches, git, dev config, and non-runtime dirs. Result: image
+size 183 MB (vs. estimated ~700 MB without `.dockerignore`).
+
+**Rule of thumb**: any Dockerfile with `COPY . .` REQUIRES a
+`.dockerignore`. Missing one is a security bug, not a style choice.
+
+### 5.3.2 — `USER appuser` must be BEFORE `RUN uv sync`, not after
+
+Original draft:
+```dockerfile
+RUN uv sync --no-dev        # ← runs as root, .venv/ owned by root
+COPY . .
+USER appuser                # ← too late
+CMD ["uv", "run", "uvicorn", ...]
+```
+
+Fly deploy #1 machine loop-crashed 10 times with:
+```
+error: failed to remove file `/app/.venv/lib/python3.12/site-packages/../../../bin/evals`:
+  Permission denied (os error 13)
+```
+
+Root cause: `CMD ["uv", "run", ...]` re-syncs project scripts (`mda`,
+`evals` from `[project.scripts]`) on every container start. As appuser
+it can't overwrite root-owned files in `.venv/bin/`. Fly gave up after
+10 restart attempts (`max_restart_count`).
+
+Fix — move `USER appuser` + `chown /app` BEFORE `uv sync`:
+```dockerfile
+RUN useradd -m -u 1000 appuser && mkdir -p /app && chown appuser:appuser /app
+WORKDIR /app
+USER appuser
+ENV PATH="/app/.venv/bin:${PATH}"
+COPY --chown=appuser:appuser pyproject.toml uv.lock ./
+RUN uv sync --no-dev --frozen --no-install-project  # ← runs as appuser
+```
+
+### 5.3.3 — `CMD` must be direct binary, NOT `uv run`
+
+Even with 5.3.2 fixed, `CMD ["uv", "run", "uvicorn", ...]` still
+re-syncs on every container start. That's:
+
+- ~2-3 s of wasted cold start per boot (project wheel rebuild + entry
+  point install).
+- A source of runtime surprises if `.venv/` ever becomes read-only
+  (e.g. immutable image layers on some runtimes).
+
+Fix — invoke uvicorn directly via absolute path (venv is on `PATH` from
+5.3.2, but absolute path is defensive):
+```dockerfile
+CMD ["/app/.venv/bin/uvicorn", "matchday_agent.app:app", "--host", "0.0.0.0", "--port", "8080"]
+```
+
+### 5.3.4 — Second `RUN uv sync` needed AFTER `COPY . .`
+
+Once 5.3.3 removed the runtime re-sync safety net, deploy #2 crashed with:
+```
+ModuleNotFoundError: No module named 'matchday_agent'
+```
+
+Root cause: Phase 0 draft ran `uv sync` BEFORE `COPY . .`. Without
+`src/` present, uv installs dependencies but **skips the local
+matchday-agent package** (nothing to build). The old `uv run` masked
+this by re-syncing at container start; without it, the module is
+genuinely absent from `.venv/`.
+
+Fix — two-step sync that preserves layer caching:
+```dockerfile
+# Step 1: deps only. Layer cached across code changes.
+COPY --chown=appuser:appuser pyproject.toml uv.lock ./
+RUN uv sync --no-dev --frozen --no-install-project
+
+# Step 2: install local package after source is present.
+COPY --chown=appuser:appuser . .
+RUN uv sync --no-dev --frozen
+```
+
+**Rule of thumb**: any Dockerfile that installs a local Python package
+via uv/pip needs the COPY-then-install ordering. Deps can be
+pre-installed with a `--no-install-project` (uv) or `--no-deps` (pip)
+flag for layer-caching, but the local package MUST come after the
+source COPY.
+
+---
+
+## 5.4 — `fastembed` model cache is ephemeral per cold start
+
+`intfloat/multilingual-e5-large` (2.24 GB) downloads to
+`/home/appuser/.cache/fastembed/` on first `search_football_context`
+invocation. That directory lives on the container's ephemeral tmpfs
+(default Fly.io machine has no persistent volume) — **lost on every
+`fly machine stop`**. Every cold start pays the download again.
+
+**v1 acceptance** (documented, not fixed):
+
+- Anchor cases that DON'T trigger RAG (cases #2, #3, #4, #5): warm within
+  the ~20 s cold start budget.
+- Anchor case #1 (RAG-triggered) first-invocation after a cold start:
+  ~60-90 s end-to-end (cold start + embedder download + init + LLM).
+- Subsequent RAG calls on the same warm machine: normal 2-5 s.
+- Memory: 2.24 GB download + model load fits in 512 MB VM only because
+  fastembed streams the download rather than holding the whole tarball
+  in memory. Model at rest ~1.3 GB — MAY require bumping to 1 GB VM if
+  we see OOM.
+
+**Phase 6+ mitigation options**:
+
+- **(a) Bake into image**: `RUN python -c "from fastembed import
+  TextEmbedding; TextEmbedding(...)"` at build time. Image grows 330
+  MB → ~2.5 GB. Slower push, faster startup. Not free.
+- **(b) Fly volume**: attach a small volume to `/home/appuser/.cache`
+  for persistent model cache. Per-region cost, makes deploys stateful,
+  complicates multi-region scale-out.
+- **(c) Lifespan warm-up**: block `app.state.agent` construction on
+  embedder init at lifespan startup. Hides the cost behind cold start
+  (which already runs 20 s) but pushes cold start to ~60-80 s. Worse
+  UX for non-RAG cases.
+
+None of the three ships in v1.
+
+---
+
+## 5.5 — Groq TPD daily-limit reality hit again during Phase 5 verify
+
+Same reality as § 4.3. Groq free tier `llama-3.3-70b-versatile` has a
+100 k tokens-per-day limit (TPD). Phases 1-4 pre-consumed ~97 k. Phase 5
+verification burned:
+
+- Case #3 (`Compará Real Madrid vs Barcelona`): ~3 k tokens → SUCCESS.
+  Full happy-path SSE contract verified.
+- Case #1 (`¿Cómo llega el Real Madrid al clásico...?`) requested ~3 k
+  more → hit 429:
+  ```
+  RateLimitError: Rate limit reached for model `llama-3.3-70b-versatile`
+  in organization `org_01k83xdqrmf68s11zcxss4vmpr` service tier `on_demand`
+  on tokens per day (TPD): Limit 100000, Used 97209, Requested 3019.
+  ```
+
+**Positive side-effect**: the natural 429 produced a real `event: error`
+frame from Groq's upstream, verifying the SSE `event: error` contract
+path in production with a genuine (non-synthesized) failure. Combined
+with case #3's happy-path coverage, the SSE contract is byte-verified
+end-to-end on the live URL.
+
+**Rule of thumb (already in § 4.3, reinforced)**: at portfolio scale,
+provider quotas are the operational bottleneck, not compute. Either
+provision paid tier for at least one provider, or accept per-quota-cycle
+verification cadence. Provider swap via `LLM_PROVIDER` env override
+(demonstrated in § 3.6) is the free-tier escape hatch.
+
+---
+
+## 5.6 — SSE contract fully verified on the live URL
+
+Full contract validated in production. All 5 event kinds fired, all
+field shapes match the frozen contract in
+[`api-contract.md`](./api-contract.md).
+
+**Case #3 evidence** (session `c64f94f9-c06c-48d9-86b5-9f562a878c7b`):
+
+- 3 `event: tool_call` in a SINGLE assistant response
+  (`compare_teams` + `find_team` ×2) — parallel tool execution
+  confirmed in the live deploy.
+- 3 `event: tool_result` — all `ok: true`, one per call, `id` echoes
+  the corresponding `tool_call.id`.
+- 328 `event: token` — Spanish response tokens streaming.
+- 1 `event: final` with the full accumulated `message` + `sources: []`
+  (per § 3.7 v1 note).
+- Total wall-clock 2.47 s on the warm machine.
+
+**Case #1 evidence** (session `e1e2a32c-a8fa-41ae-a14e-648bace7fb72`):
+
+- 1 `event: error` with
+  `{"code": "RateLimitError", "message": "Error code: 429 - ..."}`.
+- Stream cleanly closed after the error (correct per contract).
+- Wall-clock 0.47 s (server refused before any LLM call, per Groq's
+  fast-fail on quota exhaustion).
+
+**CORS positive** (from `https://matchday-mcp-web.vercel.app`):
+
+```
+HTTP/2 200
+vary: Origin
+access-control-allow-origin: https://matchday-mcp-web.vercel.app
+access-control-allow-methods: GET, POST
+access-control-allow-headers: Accept, Accept-Language, Content-Language, Content-Type, X-Session-Id
+```
+
+**CORS negative** (from `https://evil.example.com`):
+
+```
+HTTP/2 400
+vary: Origin
+(NO access-control-allow-origin header — browser default block)
+```
+
+---
+
+## 5.7 — `fly launch --no-deploy` normalized `fly.toml`, dropped comments
+
+Running `fly launch --no-deploy --copy-config --name matchday-agent
+--region iad --yes` created the app on Fly.io AND rewrote `fly.toml`
+with normalized formatting:
+
+- Double-quote strings → single-quote (TOML style flyctl prefers).
+- Keys re-ordered alphabetically within each table.
+- **All inline comments stripped**.
+
+Restored the semantic-critical comments by hand:
+
+- Region-choice rationale (Supabase DB latency).
+- Idle SSE streams do NOT keep the machine awake (Phase 0 § 0.6 gotcha).
+- Memory bump threshold (`512mb` → `1gb` if Node subprocess + pgvector
+  pressure it).
+- `[env]` section header explaining non-secret vs. secret split.
+
+**Rule of thumb for future fly.toml edits**: after any `fly launch`
+run, `git diff fly.toml` and manually restore any comments the CLI
+dropped. flyctl treats comments as unnecessary; humans reading the
+file need them.
+
+---
+
+## 5.8 — Runtime env split: `[env]` in fly.toml vs. `fly secrets set`
+
+Non-secret config lives in `fly.toml [env]` (versioned in git,
+readable in the deployed config, no encryption overhead):
+
+- `PORT`, `LOG_LEVEL`
+- `LANGSMITH_TRACING = 'true'` — required for auto-instrumentation to fire (§ 0.9)
+- `LLM_PROVIDER = 'groq'`, `LLM_MODEL = 'llama-3.3-70b-versatile'` — explicit defaults
+  so a provider swap is a one-line `fly.toml` edit + redeploy (or a
+  `fly secrets set LLM_PROVIDER=...` override without redeploy).
+
+The 6 real secrets live in `fly secrets set --stage` (per § 0.6):
+`GROQ_API_KEY`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`,
+`DATABASE_URL`, `FOOTBALL_DATA_TOKEN`, `ALLOWED_ORIGINS`.
+
+**`ALLOWED_ORIGINS` in prod** = `https://matchday-mcp-web.vercel.app`
+only. Local dev keeps `http://localhost:5173` in `.env` for uvicorn on
+localhost. No leak between environments.
+
+**Rule of thumb**: any env that has a public default and is safe to
+commit goes in `fly.toml [env]`. Anything derived from a service token,
+password, DSN, or per-environment URL goes in `fly secrets set`.
+
+---
+
+## 5.9 — Auto-start + auto-stop both verified end-to-end
+
+**Auto-start**: `fly deploy` completed with the machine in `stopped`
+state (per the deploy log: `Machine 8654602ae6d6e8 reached stopped
+state · ✔ Machine ... is now in a good state`). The first external
+`/health` request 4 minutes later took 20.79 s — that IS the
+cold-start-from-stopped path.
+
+**Auto-stop**: last external request was `case #1` at 22:09:39 UTC.
+`fly machine list` at 22:13:38 UTC (LAST_UPDATED timestamp) reported
+`state = stopped`, `checks = 0/1`. Auto-stop delay ≈ 4 min after last
+inbound traffic — within the range Fly's scheduler documents. Fly's
+internal `/health` probes (every 30 s per `fly.toml`) do NOT count as
+traffic for the auto-stop decision, as documented.
+
+**Debugging note**: a snapshot check at 22:12 (3 min post-request)
+still showed `state = started`. That earlier reading was pre-auto-stop
+by ~1 min. Do not fire the check too early — Fly's scheduler runs on
+its own cadence, and any check within the first 3-5 min of idle will
+race the scheduler.
+
+**If auto-stop delay becomes a cost concern later**: revisit
+health-check interval (`60s` or `120s` reduces probe density on Fly's
+side but does not affect auto-stop timing), or set an explicit
+`services.processes.stop_wait_timeout` in `fly.toml`.
+
