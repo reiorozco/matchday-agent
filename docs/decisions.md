@@ -400,7 +400,7 @@ Per the user's directive (skills.sh registry, validated):
 | `supabase-postgres-best-practices` ⭐ | supabase (official) | Phase 0 (now)     |
 | `fastapi-python`                     | mindrally           | Phase 0 (now)     |
 | `python-testing-patterns`            | wshobson            | Phase 0 (now)     |
-| `pydantic`                           | bobmatnyc           | Phase 0 (now)     |
+| `pydantic`                           | pydantic/skills (official) | Phase 0 (now)     |
 | ~~`sqlalchemy`~~                     | ~~bobmatnyc~~       | **Skipped** — 0.3 chose raw psycopg |
 
 Core agentic (LangGraph / LangSmith / MCP Python) has no autoskills

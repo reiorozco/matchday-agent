@@ -33,3 +33,9 @@ dist/
 
 # opencode / agent runtime state
 .omo/run-continuation/
+
+# skills.sh — installed skill files are machine-local (paths in ~/.agents).
+# The versions used by this project are pinned via content hash in skills-lock.json,
+# which IS tracked. Do not commit the actual skill payloads.
+.agents/
+.claude/skills/
