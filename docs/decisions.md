@@ -991,3 +991,176 @@ v1-empty with a "reserved for Phase 4+" note:
 The frozen contract's SHAPE is future-proof; only the CONTENT is
 minimally populated. Consumers written today will not break when
 Phase 4 fills in these fields.
+
+---
+
+# Phase 4 — Outcomes
+
+Snapshot date: 2026-07-26. Phase 4 shipped on `matchday-agent` main.
+LangSmith observability + programmatic evals wired. Dataset
+`matchday-agent-anchor-cases` (15 examples: 5 anchor cases × 3 phrasing
+variations) created in LangSmith. Runner `uv run evals` composes the
+full agent stack + calls `aevaluate()` with 3 evaluators (correctness
+Gemini-judge, tool_selection set-overlap, latency wall-clock). **Baseline
+capture blocked by free-tier daily quotas** — infra proven end-to-end,
+quantitative baseline pending rerun with reset quotas (or paid tier).
+
+Full closing notes with runtime evidence live in the spec
+(`~/Dev/matchday-mcp/specs/004-langgraph-agent.md § Phase 4`); this
+section is the source of truth for the decisions that lock choices
+for Phase 5+.
+
+---
+
+## 4.1 — LangSmith SDK 0.10.10 dataset must be HOSTED for aevaluate()
+
+**Discovered empirically**: passing a `list[dict]` or `list[Example]`
+directly to `aevaluate(data=...)` triggers a 404
+(`LangSmithNotFoundError: Reference dataset not found`). LangSmith
+internally calls `first_example.dataset_id` inside `_get_project()`
+BEFORE converting raw items — so a zero UUID or missing dataset_id
+attribute crashes the setup before any target invocation.
+
+**Locked pattern** (`src/matchday_agent/evals/runner.py::_ensure_dataset`):
+
+```python
+try:
+    client.read_dataset(dataset_name=DATASET_NAME)
+except LangSmithNotFoundError:
+    dataset = client.create_dataset(dataset_name=DATASET_NAME, ...)
+    client.create_examples(dataset_id=dataset.id, examples=[...raw dicts...])
+return DATASET_NAME  # pass the NAME to aevaluate, not the examples
+```
+
+Then: `aevaluate(target, data=DATASET_NAME, ...)`.
+
+**Idempotency**: `read_dataset` + fallback-to-`create_dataset` means
+reruns reuse the same LangSmith dataset. Multiple `aevaluate()` calls
+add new EXPERIMENTS under the same dataset in the UI (good for
+tracking regression over time). If the JSONL content changes and you
+want a fresh dataset, delete via the LangSmith UI or bump
+`DATASET_NAME`.
+
+**Do NOT** try to skip dataset creation by setting `upload_results=False` —
+that works technically but loses the LangSmith UI trace, which is the
+whole point of Phase 4 observability.
+
+---
+
+## 4.2 — LangSmith typing gaps require `cast(Any, ...)` on evaluators
+
+`aevaluate(evaluators=...)` typing signature expects
+`Sequence[EVALUATOR_T | AEVALUATOR_T]` where the protocol is a strict
+`(Run, Example | None) -> EvaluationResult` shape. LangSmith runtime
+introspects each evaluator's signature and passes only the args the
+function requests (any subset of `inputs`, `outputs`, `reference_outputs`,
+`run`, `example`) — but pyright can't infer that flexibility.
+
+**Fix**: `cast(Any, [correctness_evaluator, tool_selection_evaluator, latency_evaluator])`
+when passing to `aevaluate()`. Same pattern as `slowapi._rate_limit_exceeded_handler`
+in § 3.3 — legitimate type assertion, NOT a suppression. Documented in
+the runner inline.
+
+**Evaluator return shape** (all 3): `dict` with `{"key": str, "score": number, "comment": str}`.
+Do NOT return bare float / bool — deprecated.
+
+**Metadata flow**: `example.metadata` (case_id, case_name) does NOT auto-flow
+to evaluators. Put comparable data in `example.outputs` instead (where
+`reference_summary` and `expected_tools` live). Evaluators receive it via
+`reference_outputs`.
+
+**Attaching per-run metadata to LangGraph via config**:
+
+```python
+config: RunnableConfig = {
+    "configurable": {"thread_id": ...},
+    "metadata": {"eval_session_id": ..., "model": ..., "env": "eval"},
+    "tags": ["eval", "phase-4"],
+}
+await agent.ainvoke({"messages": [...]}, config=config)
+```
+
+`metadata` and `tags` go at the top level of `config`, NOT nested inside
+`configurable`. LangGraph propagates them into the LangSmith run
+automatically.
+
+---
+
+## 4.3 — Free-tier quota reality bites at portfolio scale
+
+Empirical finding: 15-example × 3-evaluator eval runs are marginal
+against free-tier daily quotas of both providers.
+
+| Provider | Free-tier daily limit | Consumed by Phases 1-4 | Result |
+|---|---|---|---|
+| Groq `llama-3.3-70b-versatile` | 100,000 tokens/day (TPD) | ~97,000+ | 15/15 agent calls returned 429 `rate_limit_exceeded` |
+| Gemini `gemini-3.5-flash` | **20 requests/day/model/project** | ~30 attempted (15 agent + judge) | 15/15 agent calls returned 429 `RESOURCE_EXHAUSTED` |
+
+Gemini's daily-request limit is far tighter than Groq's token limit
+and hits FIRST for eval workloads. This surfaced only during Phase 4
+because Phases 1-3 were interactive (small, occasional calls) whereas
+evals are burst.
+
+**Rule of thumb for future eval work**:
+
+1. Portfolio-scale eval runs need EITHER (a) paid tier for at least
+   ONE provider, or (b) time-boxed reruns once per quota reset window.
+2. The runner supports mid-run failures gracefully — `aevaluate` with
+   `error_handling='log'` (default) captures errors as
+   `{"correctness": 0, "comment": "judge error: ..."}` rather than
+   aborting the whole run. You get a `baseline.md` with partial or
+   zero data + LangSmith traces of all attempts, useful for
+   infrastructure verification even when quantitative scores are
+   blocked.
+3. Consider adding a `--limit N` flag to the runner for subsampling
+   during iteration (defer to Phase 6 polish; not blocking Phase 5).
+4. The dataset in LangSmith (`matchday-agent-anchor-cases`) persists
+   across quota-blocked reruns. When quotas reset, `uv run evals`
+   just adds a new experiment against the same dataset — no repair
+   work needed.
+
+---
+
+## 4.4 — Runner architecture: reuse the same AsyncExitStack as CLI + app
+
+`src/matchday_agent/evals/runner.py::_amain` composes the identical
+resource stack as `cli.py::_amain` and `app.py::lifespan`:
+
+```
+AsyncExitStack
+  └── AsyncPostgresSaver.from_conn_string(DSN)
+  └── matchday_mcp_tools()  (spawns npx matchday-mcp)
+  └── build_agent(model, [*mcp_tools, search_football_context], checkpointer)
+```
+
+This is the third caller (CLI + FastAPI + evals) — the composition is
+now a load-bearing pattern. If a Phase 5+ change adds a new resource
+(e.g. a Redis rate-limit backend, an OpenTelemetry exporter), it goes
+into ALL THREE places. The refactor target is a shared factory
+(`build_full_agent_stack()` returning the compiled agent) once we hit
+a 4th caller.
+
+The `target` function inside `_amain` wraps `agent.ainvoke()` and
+attaches per-request metadata + tags, then returns
+`{"output": final_message_text}`. `extract_chunk_text` (from the
+Phase 3 shared streaming helpers) handles both Groq's `str` and
+Gemini 3.x's `list[dict]` content shapes transparently.
+
+---
+
+## 4.5 — Hand-written reference summaries beat self-baseline
+
+The 15 `reference_summary` fields in `evals/anchor_cases.jsonl` are
+hand-written to describe "what a good answer looks like" — expected
+tools, expected numbers where they're stable this snapshot, honest
+acknowledgment of gaps where data isn't in scope.
+
+**Rejected alternative**: self-baseline (run the agent once, capture
+its output as reference). Trivially scores 5/5 on every re-run — no
+regression signal.
+
+**Consequence**: when the underlying data drifts (standings change
+mid-season, top scorers shuffle), the reference summaries need
+manual refresh. Acceptable at portfolio-scale (~15 min of editing
+per season) and prevents the false-positive drift a self-baseline
+would silently absorb.

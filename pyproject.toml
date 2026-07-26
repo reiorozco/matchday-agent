@@ -47,6 +47,7 @@ dev = [
 # CLI entry point for local end-to-end conversation testing (Phase 1).
 [project.scripts]
 mda = "matchday_agent.cli:main"
+evals = "matchday_agent.evals.runner:main"
 
 [build-system]
 requires = ["hatchling"]
