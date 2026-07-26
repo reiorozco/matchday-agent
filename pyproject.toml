@@ -66,3 +66,15 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+# basedpyright defaults to "recommended" mode which is stricter than pyright's
+# "standard". The langchain / langgraph ecosystem returns lots of untyped
+# generics ("Unknown") through its public API, and pipes side-effect-only
+# calls (argparse.add_argument, print) that "recommended" mode flags as
+# reportUnusedCallResult. We drop to pyright's "standard" baseline so we
+# still catch real errors (missing imports, wrong arg types, undeclared
+# generics) without drowning in ecosystem noise.
+[tool.basedpyright]
+include = ["src/matchday_agent"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
