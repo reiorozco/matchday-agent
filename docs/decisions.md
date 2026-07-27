@@ -1659,3 +1659,138 @@ from this schema without touching Python source.
 models in `app.py` (`ChatRequest`, `ChatResponse`, `RootResponse`,
 `HealthResponse`) are the source; `/openapi.json` is the projection.
 
+---
+
+# Phase 4 polish — Outcomes (2026-07-27)
+
+Snapshot date: 2026-07-27. Three baseline rerun attempts today.
+Groq's TPD rolling window and Gemini's 20-req/day quota both blocked
+quantitative capture again — infra polished with two real deliverables
+(judge model swap + `--limit N` runner flag). Baseline `.md` restored
+to a structured placeholder with the 3-attempt log. Full runtime
+evidence in the closing notes of spec 004 § Phase 4; this section is
+the source of truth for the decisions.
+
+---
+
+## 4.6 — Judge model swap: `gemini-3.5-flash` → `gemini-flash-latest`
+
+`src/matchday_agent/evals/judge_prompt.py::JUDGE_MODEL_ID` changed
+from `google_genai:gemini-3.5-flash` (pinned) to
+`google_genai:gemini-flash-latest` (documented alias per § 0.1 +
+`.env.example`).
+
+**Trigger**: `gemini-3.5-flash` returned persistent HTTP 503
+UNAVAILABLE on 2026-07-27 (Google-side capacity issue, NOT a client
+quota — same 503 across 3 back-to-back probes). The `-latest` alias
+routes to Google's current flash generation (`gemini-3.6-flash`
+today per the quota error observed in § 4.8) and responded cleanly.
+
+**Trade-off**: the alias auto-updates, so judge behavior can drift
+across reruns. Accepted because (a) the regression threshold is
+`correctness_mean drop > 0.5` (tolerates minor judge drift),
+(b) the pinned version is currently unavailable, (c) the alias is
+already documented as an option in `.env.example` (not new API
+surface). Documented in `judge_prompt.py`'s docstring.
+
+**Rule of thumb**: pin production model versions in code, but keep
+the `-latest` alias as an escape hatch env option for the day the
+pinned version becomes unavailable.
+
+---
+
+## 4.7 — Runner `--limit N` flag delivered (Phase 6+ polish, closed)
+
+The Phase 4 § 4.3 note ("Consider adding a `--limit N` flag to the
+runner for subsampling during iteration (defer to Phase 6 polish;
+not blocking Phase 5)") is now delivered:
+
+- `src/matchday_agent/evals/runner.py::_parse_limit_from_argv` parses
+  `--limit N` or `--limit=N` from `sys.argv[1:]` (no argparse
+  dependency — 10 LOC).
+- `_amain(limit: int | None)` slices `examples[:limit]` when set.
+- When `--limit N` is present, the runner uses a SEPARATE hosted
+  dataset name `matchday-agent-anchor-cases-sample{N}` — keeps the
+  main 15-example dataset clean for full runs, avoids re-uploading
+  every rerun.
+- `_ensure_dataset(client, examples, dataset_name)` now takes an
+  explicit name parameter instead of reading from the module-level
+  constant — enabler for the subset dataset naming.
+
+Usage:
+
+```bash
+uv run --env-file .env evals --limit 5   # 5 cases (one variant per anchor)
+uv run --env-file .env evals             # full 15 cases
+```
+
+**Cost profile**:
+
+- `--limit 5` = 5 agent calls + 5 judge calls = 10 total LLM calls.
+  Fits under Gemini's 20-req/day cap by itself. Groq: ~10 k tokens.
+- Full 15 = 15 + 15 = 30 total LLM calls. Exceeds Gemini's 20/day
+  hard cap for the judge; needs a paid tier or a different judge
+  provider to complete cleanly on Google's free tier.
+
+**Rule of thumb**: default to `--limit 5` during iteration to conserve
+quotas; run full 15 only when you're capturing a definitive baseline.
+
+---
+
+## 4.8 — 2026-07-27 rerun attempts: all quota-blocked
+
+Three attempts today, distinct failure signatures documented for
+future debugging:
+
+| # | Config                                                                          | Wall-clock | Result                                                                                                              |
+|---|---------------------------------------------------------------------------------|-----------:|---------------------------------------------------------------------------------------------------------------------|
+| 1 | agent=`groq:llama-3.3-70b-versatile`, judge=`gemini-flash-latest`, 15 cases     | 6 m 27 s   | 10× `RateLimitError 429` (Groq TPD) + 6× `tool_use_failed 400` (Groq near-cap degradation § 3.6). All 15 → 0 score. |
+| 2 | agent=`groq:llama-3.3-70b-versatile`, judge=`gemini-flash-latest`, `--limit 5`  | 1 m 20 s   | All 5 → `tool_use_failed 400`. Groq degradation continues even at 10 k-token load.                                  |
+| 3 | agent=`gemini-flash-latest`, judge=`gemini-flash-latest`, `--limit 5`           | 2 m 56 s   | Gemini `RESOURCE_EXHAUSTED 429` — 20-req/day cap for `gemini-3.6-flash` (alias resolution) hit within the run.      |
+
+**Groq TPD reality check**: § 4.3 estimated "wait ~24 h from
+2026-07-26" for the daily cap to reset. Empirically the rolling
+window seems tighter — 30 h later (`2026-07-27 15:47` local) Groq
+still degrades under sustained load (concurrent 2 agents at ~4 k
+tokens per burst hits the wall). The "rate limit reset" hint in the
+error message (`Please try again in Xms`) is per-minute TPM, not the
+per-day TPD which appears to be a smoothed rolling window rather
+than a hard clock reset.
+
+**Gemini alias resolution surprise**: `gemini-flash-latest` currently
+resolves to `gemini-3.6-flash` (visible in the 429 quota error's
+`quotaDimensions.model` field), which counts against the same
+`GenerateRequestsPerDayPerProjectPerModel-FreeTier` bucket as the
+alias itself. So swapping agent to `gemini-flash-latest` didn't
+double the effective quota — both agent + judge share it.
+
+**Practical implication for future evals**:
+
+1. Use `--limit 5` by default during iteration.
+2. For a full 15-case baseline, either upgrade one provider to paid
+   tier OR provision a distinct GCP project for the judge (`gemini-flash-latest`
+   quota is per-project — a fresh project = fresh 20/day).
+3. `baseline.md` STATUS section reflects the 3-attempt history
+   honestly; do NOT commit runner-generated 0-score tables as if
+   they were baselines.
+
+---
+
+## 4.9 — `baseline.md` policy: never commit runner-generated failure tables
+
+The runner overwrites `evals/baseline.md` on every invocation
+regardless of run success. If a run fails (all cases 0 score), the
+generated table looks like a "baseline" of 0s — which is misleading
+if committed.
+
+**Policy** (enforced in this repo starting 2026-07-27):
+
+- **Real baseline runs** (all scores > 0): commit the runner-generated
+  `baseline.md` as-is.
+- **Failed / quota-blocked runs**: after the runner writes, REPLACE
+  `baseline.md` with a structured placeholder that includes the
+  attempt log, infrastructure evidence, and the regeneration recipe.
+  The current file is an example of this shape.
+- The `# STATUS:` line at the top of `baseline.md` is the tell —
+  presence = placeholder; absence = real baseline.
+

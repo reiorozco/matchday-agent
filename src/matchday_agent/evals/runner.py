@@ -45,25 +45,27 @@ MAX_CONCURRENCY = 2
 BASELINE_PATH = Path("evals/baseline.md")
 
 
-def _ensure_dataset(client: Client, examples: list[dict[str, Any]]) -> str:
+def _ensure_dataset(
+    client: Client, examples: list[dict[str, Any]], dataset_name: str
+) -> str:
     """Read the dataset if it exists, else create it and upload examples.
 
     Uses a stable name so re-runs across days build on the same dataset
     in the LangSmith UI. If the JSONL content changes, delete the dataset
-    from the UI first (or bump DATASET_NAME) to force a fresh upload.
+    from the UI first (or bump the name) to force a fresh upload.
     """
     try:
-        existing = client.read_dataset(dataset_name=DATASET_NAME)
-        print(f"[dataset] reusing existing '{DATASET_NAME}' (id={existing.id})")
-        return DATASET_NAME
+        existing = client.read_dataset(dataset_name=dataset_name)
+        print(f"[dataset] reusing existing '{dataset_name}' (id={existing.id})")
+        return dataset_name
     except LangSmithNotFoundError:
-        print(f"[dataset] creating '{DATASET_NAME}' with {len(examples)} examples")
+        print(f"[dataset] creating '{dataset_name}' with {len(examples)} examples")
         dataset = client.create_dataset(
-            dataset_name=DATASET_NAME,
+            dataset_name=dataset_name,
             description="Phase 4 anchor cases (5 cases x 3 phrasing variations)",
         )
         client.create_examples(dataset_id=dataset.id, examples=cast(Any, examples))
-        return DATASET_NAME
+        return dataset_name
 
 
 def _resolve_model_id() -> str:
@@ -180,7 +182,7 @@ def _format_markdown_table(
     return "\n".join(lines)
 
 
-async def _amain() -> int:
+async def _amain(limit: int | None = None) -> int:
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
         print("DATABASE_URL is not set", file=sys.stderr)
@@ -192,11 +194,21 @@ async def _amain() -> int:
     model_id = _resolve_model_id()
     print(f"[startup] agent-model={model_id} judge-model={JUDGE_MODEL_ID}")
 
-    examples = load_examples()
-    print(f"[startup] loaded {len(examples)} examples")
+    all_examples = load_examples()
+    if limit is not None and limit > 0:
+        examples = all_examples[:limit]
+        dataset_name_target = f"{DATASET_NAME}-sample{limit}"
+        print(
+            f"[startup] --limit {limit}: using {len(examples)}/{len(all_examples)} examples "
+            f"against separate dataset '{dataset_name_target}'"
+        )
+    else:
+        examples = all_examples
+        dataset_name_target = DATASET_NAME
+        print(f"[startup] loaded {len(examples)} examples · dataset={dataset_name_target}")
 
     client = Client()
-    dataset_name = _ensure_dataset(client, examples)
+    dataset_name = _ensure_dataset(client, examples, dataset_name_target)
 
     model = init_chat_model(model_id, temperature=0.0)
 
@@ -257,9 +269,20 @@ async def _amain() -> int:
     return 0
 
 
+def _parse_limit_from_argv(argv: list[str]) -> int | None:
+    """Parse `--limit N` or `--limit=N` from CLI args. Return None if absent."""
+    for i, arg in enumerate(argv):
+        if arg == "--limit" and i + 1 < len(argv):
+            return int(argv[i + 1])
+        if arg.startswith("--limit="):
+            return int(arg.split("=", 1)[1])
+    return None
+
+
 def main() -> None:
+    limit = _parse_limit_from_argv(sys.argv[1:])
     try:
-        rc = asyncio.run(_amain())
+        rc = asyncio.run(_amain(limit=limit))
     except KeyboardInterrupt:
         rc = 130
     raise SystemExit(rc)
