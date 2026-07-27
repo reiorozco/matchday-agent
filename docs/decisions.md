@@ -1794,3 +1794,68 @@ if committed.
 - The `# STATUS:` line at the top of `baseline.md` is the tell —
   presence = placeholder; absence = real baseline.
 
+---
+
+# Phase 7 — Outcomes
+
+Snapshot date: 2026-07-27. Phase 7 (brand integration) shipped: LinkedIn
+copy drafted, profile README updated in-place, closing notes in
+spec 004. Full closing notes live in
+`~/Dev/matchday-mcp/specs/004-langgraph-agent.md § Phase 7`; this
+section is the source of truth for the marketing-artifact locations.
+
+---
+
+## 7.1 — LinkedIn assets live at `docs/marketing/linkedin.md`
+
+Single Markdown file holding all copy-paste-ready LinkedIn content:
+
+- **Featured card description** (ES + EN, ~200 chars each) — pastes
+  into LinkedIn's "Add a link → Description" field.
+- **Post 1** (retrospective, Phase 2 RAG shipped, ES + EN,
+  ~1 500 chars each) — pastes into feed post composer.
+- **Post 2** (milestone, Phase 5-6 v1 live, ES + EN, ~2 000 chars
+  each, includes a working curl block) — pastes into feed post
+  composer.
+- **Profile README update notes** — records what changed on
+  `reiorozco/reiorozco` and why.
+- **Memory-files note** — `marca-profesional-2026` +
+  `github-audit-2026` are user-owned outside any matchday repo;
+  user syncs them manually.
+
+**Rule of thumb** (for future portfolio phases): keep all
+LinkedIn / marketing copy in one Markdown file per project under
+`docs/marketing/`. Git tracks the drafts; publishing is a manual
+copy-paste step by the user. Never auto-publish.
+
+## 7.2 — Profile README update: single commit, no partial states
+
+`reiorozco/reiorozco` README updated via a single atomic commit
+(clone to `$TMPDIR`, edit, commit, push, cleanup). Three changes
+in the commit:
+
+1. `matchday-agent` inserted as new row 1 in Featured Projects.
+2. `matchday-mcp` row description tweaked to reference the agent
+   as a downstream consumer (preserves its identity as the
+   foundational layer).
+3. AI Engineering learning bullet expanded to include LangGraph
+   agents + point at `matchday-agent` (was pointing at `matchday-mcp`).
+
+**Rule of thumb**: profile README updates go via a temporary clone
+under `$TMPDIR/reiorozco-profile`, NOT via GitHub's API PUT with
+base64 content. Local clone gives standard git tooling for the
+diff review, is easier to abort if something looks wrong, and
+leaves no orphan state on the API side.
+
+## 7.3 — Memory files stay user-owned
+
+`marca-profesional-2026` + `github-audit-2026` (per spec 004
+Phase 7 checklist) live in the user's private memory system —
+outside any of the 3 matchday repos. Not touched by this Phase 7
+work. Noted in `docs/marketing/linkedin.md` + spec 004 Phase 7
+closing notes for the user to sync manually.
+
+**Rule of thumb**: NEVER auto-update memory / journal files
+outside the immediate work context — they encode the user's
+private framing of their portfolio, not just the technical state.
+
