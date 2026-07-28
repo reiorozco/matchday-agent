@@ -101,6 +101,31 @@ X-Accel-Buffering: no
 Transfer-Encoding: chunked
 ```
 
+### Frame terminators
+
+SSE frames may be terminated with `\r\n\r\n` (CRLF) or `\n\n` (LF) —
+consumers MUST split on both. The agent uses [`sse-starlette`](https://github.com/sysid/sse-starlette),
+whose [`DEFAULT_SEPARATOR = "\r\n"`](https://github.com/sysid/sse-starlette/blob/main/sse_starlette/sse.py)
+emits CRLF; the SSE spec itself is line-ending agnostic, so a different
+backend or a line-normalizing proxy may emit LF instead.
+
+Splitter (JS):
+
+```js
+const frames = buffer.split(/\r?\n\r?\n/);
+```
+
+Splitter (Python):
+
+```python
+import re
+frames = re.split(r"\r?\n\r?\n", buffer)
+```
+
+Root cause reproduced in the matchday-mcp-web client — the parser split
+on `\n\n` only and silently dropped every frame. Consumer-side fix:
+[`59d090f`](https://github.com/reiorozco/matchday-mcp-web/commit/59d090f).
+
 Event kinds (each `event:` line is followed by a `data:` line whose payload
 is JSON):
 
