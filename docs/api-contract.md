@@ -55,7 +55,7 @@ Headers:
 Body:
 
 ```json
-{ "message": "¿Cómo va el Real Madrid?" }
+{ "message": "How is Real Madrid doing?" }
 ```
 
 Constraints: `1 <= len(message) <= 4000`.
@@ -236,10 +236,10 @@ UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
 curl -s -X POST http://127.0.0.1:8000/chat \
   -H 'Content-Type: application/json' \
   -H "X-Session-Id: $UUID" \
-  -d '{"message":"¿Cómo va el Real Madrid en LaLiga?"}' | jq
+  -d '{"message":"How is Real Madrid doing in LaLiga?"}' | jq
 
 curl -N -X POST http://127.0.0.1:8000/chat/stream \
   -H 'Content-Type: application/json' \
   -H "X-Session-Id: $UUID" \
-  -d '{"message":"¿Cómo va el Real Madrid en LaLiga?"}'
+  -d '{"message":"How is Real Madrid doing in LaLiga?"}'
 ```

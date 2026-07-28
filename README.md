@@ -14,20 +14,22 @@ UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
 # Metadata (name, version, model, 7 bound tools)
 curl -sS https://matchday-agent.fly.dev/ | jq
 
-# Non-streaming JSON round-trip
+# Non-streaming JSON round-trip (English default)
 curl -sS -X POST https://matchday-agent.fly.dev/chat \
   -H 'Content-Type: application/json' \
   -H "X-Session-Id: $UUID" \
-  -d '{"message":"¿Cómo va el Real Madrid en LaLiga?"}' | jq
+  -d '{"message":"How is Real Madrid doing in LaLiga?"}' | jq
 
 # Streaming SSE — the primary consumption path for the frontend
 curl -N -X POST https://matchday-agent.fly.dev/chat/stream \
   -H 'Content-Type: application/json' \
   -H "X-Session-Id: $UUID" \
-  -d '{"message":"Compará Real Madrid vs Barcelona esta temporada"}'
+  -d '{"message":"Compare Real Madrid vs Barcelona this season"}'
 ```
 
 Reuse the same `X-Session-Id` to continue a conversation across requests — the checkpointer round-trips through Supabase Postgres. First request wakes the machine from `stopped` (~20 s cold start; ~2-3 s warm afterwards).
+
+The agent mirrors your language — try `"message":"Compará Real Madrid vs Barcelona esta temporada"` and you'll get a Spanish response back with `(fuente: X)` citations instead of `(source: X)`.
 
 ---
 
@@ -43,11 +45,11 @@ Reuse the same `X-Session-Id` to continue a conversation across requests — the
 
 ### Anchor use cases (v1 shipped)
 
-1. "¿Cómo llega X al clásico?" — recent form + top scorers + Wikipedia rivalry context.
-2. "Análisis del próximo partido de Y" — fixture + form + head-to-head.
-3. "Compará A vs B esta temporada" — statistical + form comparison.
-4. "¿Cuál liga está más disputada?" — parallel fetch of 5 top-league standings + spread computation. Exercises the parallel-tool-call pattern.
-5. "Resumen del fin de semana en LaLiga" — matches + top scorers + storylines.
+1. "How is X arriving to el Clásico?" — recent form + top scorers + Wikipedia rivalry context.
+2. "Analyze Y's next match" — fixture + form + head-to-head.
+3. "Compare A vs B this season" — statistical + form comparison.
+4. "Which of the top 5 European leagues is most contested?" — parallel fetch of 5 top-league standings + spread computation. Exercises the parallel-tool-call pattern.
+5. "LaLiga weekend summary" — matches + top scorers + storylines.
 
 ---
 
