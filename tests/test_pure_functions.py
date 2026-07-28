@@ -20,7 +20,9 @@ from fastapi import HTTPException
 from groq import RateLimitError
 
 from matchday_agent.app import (
+    _extract_rag_sources,
     _format_error_frame,
+    _tool_output_is_ok,
     _validate_provider_credentials,
     _validate_session_id,
 )
@@ -113,3 +115,53 @@ class TestValidateProviderCredentials:
 
     def test_unknown_provider_skips_validation(self) -> None:
         _validate_provider_credentials("some_future_provider")
+
+
+class TestExtractRagSources:
+    def test_extracts_urls_from_multi_hit_output(self) -> None:
+        text = (
+            "[1] Real Madrid CF (lang=en, dist=0.123)\n"
+            "    URL: https://en.wikipedia.org/wiki/Real_Madrid_CF\n"
+            "    preview text...\n\n"
+            "[2] El Clásico (lang=en, dist=0.145)\n"
+            "    URL: https://en.wikipedia.org/wiki/El_Cl%C3%A1sico\n"
+            "    another preview..."
+        )
+        assert _extract_rag_sources(text) == [
+            "https://en.wikipedia.org/wiki/Real_Madrid_CF",
+            "https://en.wikipedia.org/wiki/El_Cl%C3%A1sico",
+        ]
+
+    def test_deduplicates_while_preserving_order(self) -> None:
+        text = (
+            "[1] A\n    URL: https://x/A\n    p\n\n"
+            "[2] B\n    URL: https://x/B\n    p\n\n"
+            "[3] A again\n    URL: https://x/A\n    p"
+        )
+        assert _extract_rag_sources(text) == ["https://x/A", "https://x/B"]
+
+    def test_returns_empty_when_no_url_lines(self) -> None:
+        assert _extract_rag_sources("no rag output here, just prose") == []
+
+
+class TestToolOutputIsOk:
+    def test_normal_text_returns_true(self) -> None:
+        assert _tool_output_is_ok("Real Madrid is 1st with 62 points.") is True
+
+    def test_interrupted_marker_returns_false(self) -> None:
+        assert _tool_output_is_ok("[interrupted before completion]") is False
+
+    def test_rag_timeout_marker_returns_false(self) -> None:
+        assert _tool_output_is_ok("RAG search timed out after 25s. Try again.") is False
+
+    def test_temporarily_unavailable_marker_returns_false(self) -> None:
+        assert _tool_output_is_ok("...temporarily unavailable while a smaller...") is False
+
+    def test_none_returns_false(self) -> None:
+        assert _tool_output_is_ok(None) is False
+
+    def test_object_with_content_attr_uses_content(self) -> None:
+        class _MockToolMessage:
+            content = "[interrupted before completion]"
+
+        assert _tool_output_is_ok(_MockToolMessage()) is False
