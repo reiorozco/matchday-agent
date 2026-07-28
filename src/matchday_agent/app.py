@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -43,11 +44,20 @@ from matchday_agent.tools.rag import search_football_context
 
 _RATE_LIMIT = "20/minute"
 _TOOL_RESULT_SUMMARY_CHARS = 300
+_RAG_TOOL_NAME = "search_football_context"
 
 _PROVIDER_ENV_VARS = {
     "groq": "GROQ_API_KEY",
     "google_genai": "GOOGLE_API_KEY",
 }
+
+_RAG_URL_PATTERN = re.compile(r"^\s+URL:\s+(\S+)$", re.MULTILINE)
+
+_TOOL_ERROR_MARKERS = (
+    "[interrupted before completion]",
+    "RAG search timed out",
+    "temporarily unavailable",
+)
 
 
 class ChatRequest(BaseModel):
@@ -123,6 +133,37 @@ def _summarize_tool_output(output: Any) -> str:
     if len(text) > _TOOL_RESULT_SUMMARY_CHARS:
         return text[:_TOOL_RESULT_SUMMARY_CHARS] + "..."
     return text
+
+
+def _tool_output_is_ok(output: Any) -> bool:
+    """Best-effort success classification for the SSE `tool_result.ok` field.
+
+    LangGraph's on_tool_end event does not expose whether the tool raised
+    (both success and caught-inside-tool failures come through as normal
+    output text). We pattern-match on strings the tool wrappers use for
+    known failure states — timeout, disabled-notice, orphan-tool-call
+    interruption. Anything else (including "no results" style empty
+    successes) reports ok=true. Documented in decisions.md § 8.12.
+    """
+    if output is None:
+        return False
+    text = str(getattr(output, "content", output))
+    return not any(marker in text for marker in _TOOL_ERROR_MARKERS)
+
+
+def _extract_rag_sources(text: str) -> list[str]:
+    """Extract Wikipedia URLs from a search_football_context tool output.
+
+    The RAG tool formats each hit as a numbered block with a URL line
+    (four spaces + 'URL: <url>'). Deduplicates while preserving order.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for url in _RAG_URL_PATTERN.findall(text):
+        if url not in seen:
+            seen.add(url)
+            ordered.append(url)
+    return ordered
 
 
 def _format_error_frame(exc: BaseException) -> dict[str, str]:
@@ -285,7 +326,15 @@ async def chat(
         raise HTTPException(status_code=status, detail=error) from exc
     final_msg = result["messages"][-1]
     text = extract_chunk_text(final_msg)
-    return ChatResponse(message=text, session_id=session_id, sources=[])
+    seen: set[str] = set()
+    sources: list[str] = []
+    for msg in result["messages"]:
+        if isinstance(msg, ToolMessage) and msg.name == _RAG_TOOL_NAME:
+            for url in _extract_rag_sources(str(msg.content)):
+                if url not in seen:
+                    seen.add(url)
+                    sources.append(url)
+    return ChatResponse(message=text, session_id=session_id, sources=sources)
 
 
 @app.post("/chat/stream")
@@ -306,6 +355,8 @@ async def _sse_events(
     """Emit the frozen SSE event shape from LangGraph astream_events(v2)."""
     config: dict[str, Any] = {"configurable": {"thread_id": session_id}}
     accumulated: list[str] = []
+    sources: list[str] = []
+    seen_sources: set[str] = set()
     try:
         await _repair_orphan_tool_calls(agent, config)
         async for event in agent.astream_events(
@@ -339,21 +390,29 @@ async def _sse_events(
             elif kind == "on_tool_end":
                 tool_name = event.get("name", "?")
                 run_id = str(event.get("run_id", ""))
-                summary = _summarize_tool_output(event.get("data", {}).get("output"))
+                output = event.get("data", {}).get("output")
+                summary = _summarize_tool_output(output)
+                ok = _tool_output_is_ok(output)
+                if tool_name == _RAG_TOOL_NAME and ok:
+                    output_text = str(getattr(output, "content", output))
+                    for url in _extract_rag_sources(output_text):
+                        if url not in seen_sources:
+                            seen_sources.add(url)
+                            sources.append(url)
                 yield {
                     "event": "tool_result",
                     "data": json.dumps(
                         {
                             "id": run_id,
                             "tool": tool_name,
-                            "ok": True,
+                            "ok": ok,
                             "summary": summary,
                         }
                     ),
                 }
         yield {
             "event": "final",
-            "data": json.dumps({"message": "".join(accumulated), "sources": []}),
+            "data": json.dumps({"message": "".join(accumulated), "sources": sources}),
         }
     except Exception as exc:
         yield {

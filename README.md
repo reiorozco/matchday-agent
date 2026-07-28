@@ -193,9 +193,21 @@ fly deploy
 Update a runtime env (triggers redeploy):
 
 ```bash
-fly secrets set --stage LLM_PROVIDER=google_genai LLM_MODEL=gemini-3.5-flash
+fly secrets set --stage LLM_PROVIDER=google_genai LLM_MODEL=gemini-flash-latest
 fly deploy   # or `fly secrets deploy` if config is otherwise unchanged
 ```
+
+---
+
+## Known limitations
+
+Documented for reviewer honesty:
+
+- **Eval drift**: [`evals/anchor_cases.jsonl`](evals/anchor_cases.jsonl) references specific league standings (points, positions) that age with the live football-data.org data. Baseline scores in [`evals/baseline.md`](evals/baseline.md) may show apparent regression that's actually just data drift, not real quality loss.
+- **Cold start ~20 s on first request**: Fly auto-stops the machine after ~4 min idle to save cost. First inbound wakes it (Python + fastembed model load + MCP subprocess = 15-20 s); warm requests ~2-3 s. Deliberate cost/latency trade-off for a portfolio demo — flip to `min_machines_running = 1` in [`fly.toml`](fly.toml) for real traffic.
+- **Groq free tier daily token quota**: 100 k tokens/day on `llama-3.3-70b-versatile`. When hit, the endpoint returns a friendly `{"code": "RateLimit", "message": "Daily token quota reached..."}` payload ([decisions.md § 8.8](docs/decisions.md)) — no cryptic 500s. Recovery ~15 min; swap to Gemini via `fly secrets set LLM_PROVIDER=google_genai LLM_MODEL=gemini-flash-latest --app matchday-agent`.
+- **RAG embedder trade-off**: swapped from `intfloat/multilingual-e5-large` (1024-dim, 2.24 GB) to `paraphrase-multilingual-MiniLM-L12-v2` (384-dim, ~220 MB) after the larger model OOM-killed the 512 MB VM ([decisions.md § 8.10](docs/decisions.md)). ~5-15% retrieval-quality drop for a ~10× memory reduction — worth it to keep RAG functional on the free tier.
+- **Supabase RLS disabled on public tables**: all 5 tables (`documents`, `checkpoints`, etc.) are RLS-off. The agent uses the `DATABASE_URL` DSN directly (bypasses RLS entirely), so no current-usage impact. But the anon publishable key would grant read/write access if ever exposed to a frontend — filing as follow-up per [decisions.md § 8.11](docs/decisions.md).
 
 ---
 
