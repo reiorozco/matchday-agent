@@ -25,6 +25,11 @@ primary_region = 'iad'
   # (or a `fly secrets set` override) + redeploy — no code change per § 3.6.
   LLM_PROVIDER = 'groq'
   LLM_MODEL = 'llama-3.3-70b-versatile'
+  # Defensive stop-gap per decisions.md § 8.9 audit response: the 2.24 GB
+  # multilingual-e5-large embedder OOM-kills the 512 MB VM on first RAG
+  # call. Set to 'true' after § 8.10 model swap (multilingual-e5-small,
+  # 470 MB) + VM bump to 1 GB + fresh ingest complete.
+  RAG_ENABLED = 'false'
 
 [http_service]
   internal_port = 8080

@@ -8,6 +8,7 @@ on "rivalry / history / legendary" style questions.
 from __future__ import annotations
 
 import asyncio
+import os
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
@@ -18,6 +19,13 @@ from matchday_agent.rag.store import similar
 _MAX_K = 8
 _CONTENT_PREVIEW_CHARS = 600
 _TIMEOUT_SECONDS = 25.0
+
+_RAG_DISABLED_MESSAGE = (
+    "The Wikipedia knowledge base is temporarily unavailable while a smaller "
+    "embedding model is being provisioned to fit the deploy VM memory. Answer "
+    "without Wikipedia citations for now; the football-data.org MCP tools still "
+    "cover current standings, fixtures, top scorers, and head-to-head data."
+)
 
 
 class SearchInput(BaseModel):
@@ -57,7 +65,15 @@ async def search_football_context(query: str, k: int = 5) -> str:
     embedder or Supabase pgvector query stalls; on timeout returns a
     friendly notice the agent can gracefully fall back from (documented
     in decisions.md § 8 — post-spec-005 hotfix for Delta 3).
+
+    Guarded by RAG_ENABLED env var: when set to "false", returns the
+    disabled-notice message immediately WITHOUT loading the embedder
+    (which would OOM the 512 MB Fly VM per audit finding — see
+    decisions.md § 8.9). Default true; set false in fly.toml [env]
+    while the model swap to multilingual-e5-small ships.
     """
+    if os.environ.get("RAG_ENABLED", "true").lower() != "true":
+        return _RAG_DISABLED_MESSAGE
     try:
         return await asyncio.wait_for(_search_impl(query, k), timeout=_TIMEOUT_SECONDS)
     except TimeoutError:
