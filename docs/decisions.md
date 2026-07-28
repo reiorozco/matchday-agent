@@ -2160,3 +2160,146 @@ the audience — cheap to fix mid-project (this took ~20 min + $0.05),
 expensive to defend during a job interview if a US recruiter can't test
 the demo in English without asking.
 
+---
+
+# 8. Post-spec-005 hotfixes (2026-07-28)
+
+Feedback loop from the [`matchday-mcp-web`](https://github.com/reiorozco/matchday-mcp-web)
+spec 005 chat surfaced 3 deltas + 1 bonus on top of the shipped agent.
+Re-triaged, fixed in this pass. Documented so the pattern is reusable
+next time a downstream consumer surfaces prod-only issues.
+
+## 8.1 — Stale-deploy: `fly secrets set` does NOT rebuild the image (Delta 1, P0)
+
+**Symptom** (reported): English prompts consistently returned Spanish
+responses on the live agent, on BOTH Groq AND Gemini providers. Contradicts
+the § 4.14 language-pivot claim of English-default behavior.
+
+**Diagnosis** via `flyctl releases -a matchday-agent`:
+
+| Release | When | Trigger |
+|---:|---|---|
+| v1-v3 | Jul 26 21:50-22:06 | Phase 5 initial deploys (§ 5.3 Dockerfile iterations) |
+| v4 | today, 31 min ago | `fly secrets set` from spec-005 chat (Gemini swap, interrupted — GOOGLE_API_KEY missing) |
+| v5 | today, 27 min ago | `fly secrets set` (Gemini swap complete after secrets import) |
+| v6 | today, 16 min ago | `fly secrets set` (Groq revert) |
+
+None of v4/v5/v6 rebuilt the Docker image. The image was baked at v3
+(Jul 26 22:06) — BEFORE pivot commits `7108763` (Jul 27 23:11) and
+`f395050`. The live container was running the pre-pivot Spanish-default
+SYSTEM_PROMPT the whole time.
+
+**Root cause**: `flyctl secrets set` increments the machine version but
+reuses the existing image. Only `flyctl deploy` triggers a rebuild.
+
+**Fix**: `flyctl deploy --app matchday-agent`. That's it — the code on
+`main` was already correct; the artifact on the wire was stale.
+
+## 8.2 — RAG tool timeout wrapper (Delta 3, P1)
+
+**Symptom** (reported): a `search_football_context` call for
+`"El Clasico Real Madrid Barcelona historia rivalidad"` ran 60+ s during
+Turn 2 of a spec-005 QA session with no completion, no error, no timeout —
+the SSE stream stayed `streaming` from the client's view indefinitely.
+
+**Fix** (`src/matchday_agent/tools/rag.py`):
+
+- Extracted the current body into `_search_impl(query, k) -> str`.
+- Wrapped the call in `asyncio.wait_for(..., timeout=25.0)`.
+- On `TimeoutError` returns a friendly English string that the agent can
+  gracefully fall back from (mirror rule from `system.py` handles Spanish
+  users automatically).
+- `_TIMEOUT_SECONDS = 25.0` at module scope so the docstring's "25 s"
+  and the runtime value stay in sync.
+
+**Contract**: string return preserves the existing tool signature, so the
+LangChain wrapper still emits `tool_result.ok=true` with the timeout
+message as summary. The agent sees it in context on its next turn and
+either (a) answers without RAG or (b) tells the user RAG is unreachable.
+
+**Known trade-off**: `asyncio.to_thread(embed_query, ...)` may leak the
+worker thread if the embedder itself is genuinely stuck — Python threads
+can't be forcibly cancelled. Acceptable for MVP: steady-state most calls
+complete in <5 s, and the leak is bounded (single thread per hung call,
+never in a hot loop). Cleaner tool-level `ok=false` framing would require
+bidirectional error contract changes deferred to a later phase.
+
+## 8.3 — Fail-fast provider credential validation (Bonus, P3)
+
+**Symptom** (reported): running `fly secrets set LLM_PROVIDER=google_genai`
+without setting `GOOGLE_API_KEY` first crash-looped the app at startup
+with no clear message. Spec 005 chat burned ~2 min diagnosing on release
+v4 before running `fly secrets import` from local `.env`.
+
+**Fix** (`src/matchday_agent/app.py`):
+
+- Added `_PROVIDER_ENV_VARS: dict[str, str]` mapping providers to their
+  required env var names.
+- Added `_validate_provider_credentials(provider)` that raises
+  `RuntimeError` with a copy-pasteable `fly secrets set <VAR>=<value>`
+  fix command when the required var is missing.
+- Called from `_resolve_model_id()` so the failure surfaces during
+  lifespan startup with the actionable message, before `init_chat_model`
+  swallows the crash as an opaque SDK error.
+- Providers not in the map (unknown / future) skip validation — falls
+  through to `init_chat_model`'s own error handling.
+
+**Coverage**: today `groq` + `google_genai`. Extending is one dict entry
+per provider; no policy change.
+
+## 8.4 — Delta 2 deferred to GitHub issue: HTTP/2 SSE keepalive (P2)
+
+**Symptom** (reported): a 7-tool clásico turn on the live agent dropped
+at ~40 s with `ERR_HTTP2_PROTOCOL_ERROR`. Fly.io's HTTP/2 60 s idle
+timeout is the likely culprit for long tool chains with sparse LLM chunks.
+
+**Not fixed now** — deferred to GH issue on the agent repo:
+
+- Frontend spec-005 client already handles the drop gracefully (error
+  banner + retry button rendered correctly per QA screenshot 04).
+- `docs/api-contract.md` already documents `event: ping` as a RESERVED
+  frame type.
+- Fix path is well-understood: `EventSourceResponse(..., ping=15)` param
+  from `sse-starlette` emits `event: ping\ndata:\n\n` every 15 s.
+
+Ship gate for the fix: when the follow-up issue is picked up in a
+polish/observability pass, OR when a real user reports the drop in a
+shareable session.
+
+## 8.5 — Tangential cleanups shipped with this pass
+
+Discovered while grepping for language-forcing residue during the T2/T3
+work. Not behavior-changing but they close narrative gaps a code
+reviewer would flag post-pivot:
+
+- **`src/matchday_agent/app.py`** — `ChatRequest.message.description`
+  said `"User question in Spanish. Max 4000 chars."` → updated to
+  `"User question. Language is auto-detected — agent replies in English
+  by default and mirrors Spanish/Portuguese/French/etc."` Matches
+  `system.py` behavior.
+- **`src/matchday_agent/tools/rag.py`** — hardcoded Spanish fallback
+  `"No se encontraron chunks relevantes en la base de Wikipedia."` →
+  English `"No relevant Wikipedia chunks found for this query."` Agent
+  mirror rule handles Spanish users.
+- **`src/matchday_agent/tools/rag.py`** — docstring said `"cite them in
+  the Spanish answer"` → `"cite them in its answer"`. Tool description
+  visible to the LLM at bind time; language-agnostic wording matches
+  the pivot narrative.
+
+## 8.6 — Rule of thumb: live-probe = mandatory phase-close signal
+
+Phase 4 § 4.14 claimed the pivot was "shipped" after the local English
+baseline (3.53/5) captured. In hindsight, the local baseline proved ONE
+code path worked (runner reading `.venv`), not that the shipped artifact
+on Fly.io worked.
+
+**Rule of thumb**: for any pivot spanning code + deployment, the phase
+close gate requires ONE `curl` against the live URL that demonstrates
+the new behavior. In this case a single English probe against
+`https://matchday-agent.fly.dev/chat` would have caught the stale-deploy
+in under 30 seconds.
+
+Applies retroactively: **local test != prod verification.** Ship gate
+for every future deploy-touching pivot includes a live probe recorded
+in the phase closing note.
+

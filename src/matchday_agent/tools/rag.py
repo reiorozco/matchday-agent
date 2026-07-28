@@ -17,6 +17,7 @@ from matchday_agent.rag.store import similar
 
 _MAX_K = 8
 _CONTENT_PREVIEW_CHARS = 600
+_TIMEOUT_SECONDS = 25.0
 
 
 class SearchInput(BaseModel):
@@ -45,17 +46,33 @@ async def search_football_context(query: str, k: int = 5) -> str:
     Madrid en la Champions", "contexto cultural del derbi de Madrid".
 
     Returns a citation-formatted list of up to `k` Wikipedia excerpts with
-    their source URLs so the agent can cite them in the Spanish answer.
+    their source URLs so the agent can cite them in its answer.
 
     Do NOT use for:
     - Current standings, fixtures, or top scorers (use get_standings,
       get_matches, get_top_scorers instead).
     - Real-time or in-season data (Wikipedia lags months behind).
+
+    Wrapped in a 25 s timeout so the stream never hangs forever if the
+    embedder or Supabase pgvector query stalls; on timeout returns a
+    friendly notice the agent can gracefully fall back from (documented
+    in decisions.md § 8 — post-spec-005 hotfix for Delta 3).
     """
+    try:
+        return await asyncio.wait_for(_search_impl(query, k), timeout=_TIMEOUT_SECONDS)
+    except TimeoutError:
+        return (
+            f"RAG search timed out after {_TIMEOUT_SECONDS:.0f}s. "
+            "The Wikipedia backend may be slow or unreachable. "
+            "Try answering without RAG context if the question does not strictly need it."
+        )
+
+
+async def _search_impl(query: str, k: int) -> str:
     query_vec = await asyncio.to_thread(embed_query, query)
     hits = await similar(query_vec, k=k)
     if not hits:
-        return "No se encontraron chunks relevantes en la base de Wikipedia."
+        return "No relevant Wikipedia chunks found for this query."
     formatted: list[str] = []
     for i, h in enumerate(hits, 1):
         section = f" — {h['section_title']}" if h.get("section_title") else ""

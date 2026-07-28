@@ -42,12 +42,20 @@ from matchday_agent.tools.rag import search_football_context
 _RATE_LIMIT = "20/minute"
 _TOOL_RESULT_SUMMARY_CHARS = 300
 
+_PROVIDER_ENV_VARS = {
+    "groq": "GROQ_API_KEY",
+    "google_genai": "GOOGLE_API_KEY",
+}
+
 
 class ChatRequest(BaseModel):
     message: str = Field(
         min_length=1,
         max_length=4000,
-        description="User question in Spanish. Max 4000 chars.",
+        description=(
+            "User question. Language is auto-detected — agent replies in English by "
+            "default and mirrors Spanish/Portuguese/French/etc. Max 4000 chars."
+        ),
     )
 
 
@@ -73,9 +81,30 @@ def _validate_session_id(x_session_id: str | None) -> str:
     return x_session_id
 
 
+def _validate_provider_credentials(provider: str) -> None:
+    """Fail fast at startup if LLM_PROVIDER's required env var is missing.
+
+    Prevents opaque crash-loops when `fly secrets set LLM_PROVIDER=<x>` is
+    run without the matching API key (see decisions.md § 8, post-spec-005
+    hotfix — original bonus finding from spec 005 chat's Gemini swap that
+    interrupted release v4 for ~2 min of diagnostics).
+    """
+    env_var = _PROVIDER_ENV_VARS.get(provider)
+    if env_var is None:
+        return  # unknown provider: let init_chat_model fail with its own message
+    if not os.environ.get(env_var):
+        raise RuntimeError(
+            f"LLM_PROVIDER={provider!r} requires {env_var} to be set in the "
+            f"environment, but it is missing. "
+            f"Fix: `fly secrets set {env_var}=<value> --app matchday-agent` "
+            f"(then redeploy) or add it to .env locally."
+        )
+
+
 def _resolve_model_id() -> str:
     provider = os.environ.get("LLM_PROVIDER", "groq")
     model = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+    _validate_provider_credentials(provider)
     return f"{provider}:{model}"
 
 
