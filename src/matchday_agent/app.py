@@ -24,7 +24,7 @@ from typing import Any, cast
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -123,6 +123,46 @@ def _summarize_tool_output(output: Any) -> str:
     return text
 
 
+async def _repair_orphan_tool_calls(agent: Any, config: dict[str, Any]) -> None:
+    """Inject synthetic ToolMessages for tool_calls left pending in the checkpoint.
+
+    Prevents INVALID_CHAT_HISTORY on subsequent turns when the previous stream
+    dropped after the LLM emitted an AIMessage with tool_calls but before all
+    matching ToolMessages committed to the checkpointer. See decisions.md § 8.7
+    (spec 006 delta feedback loop) for the full failure timeline.
+
+    Walks backwards from the last message to find the most recent AIMessage
+    with tool_calls; any earlier orphan would have already blocked the graph
+    from reaching the current state, so only the tail matters.
+    """
+    state = await agent.aget_state(config)
+    messages = state.values.get("messages", [])
+    if not messages:
+        return
+
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if not tool_calls:
+            continue
+        resolved_ids: set[str] = set()
+        for j in range(i + 1, len(messages)):
+            call_id = getattr(messages[j], "tool_call_id", None)
+            if call_id:
+                resolved_ids.add(call_id)
+        pending = [tc for tc in tool_calls if tc["id"] not in resolved_ids]
+        if pending:
+            synthetic = [
+                ToolMessage(
+                    content="[interrupted before completion]",
+                    tool_call_id=tc["id"],
+                )
+                for tc in pending
+            ]
+            await agent.aupdate_state(config, {"messages": synthetic})
+        return
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     dsn = os.environ.get("DATABASE_URL")
@@ -192,6 +232,7 @@ async def chat(
     session_id = _validate_session_id(x_session_id)
     agent = request.app.state.agent
     config: dict[str, Any] = {"configurable": {"thread_id": session_id}}
+    await _repair_orphan_tool_calls(agent, config)
     result = await agent.ainvoke(
         {"messages": [HumanMessage(content=body.message)]},
         config=config,
@@ -220,6 +261,7 @@ async def _sse_events(
     config: dict[str, Any] = {"configurable": {"thread_id": session_id}}
     accumulated: list[str] = []
     try:
+        await _repair_orphan_tool_calls(agent, config)
         async for event in agent.astream_events(
             {"messages": [HumanMessage(content=user_input)]},
             config=config,

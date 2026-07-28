@@ -2303,3 +2303,86 @@ Applies retroactively: **local test != prod verification.** Ship gate
 for every future deploy-touching pivot includes a live probe recorded
 in the phase closing note.
 
+## 8.7 — Delta 1 from spec 006: orphan tool_calls checkpoint repair
+
+**Symptom** (reported from spec 006 chat, reproduced twice in one QA
+session): after a mid-stream drop during tool execution — e.g., HTTP/2
+idle drop mid-`search_football_context`, or client network glitch during
+a 5-tool parallel fan-out — subsequent requests reusing the same
+`X-Session-Id` failed with `INVALID_CHAT_HISTORY` from the LLM provider.
+Reproduced on both `"Which of the top 5 European leagues is most contested
+right now?"` (5 parallel `get_standings`) and the Spanish Clásico prompt
+after a RAG network drop.
+
+This is P0-adjacent for portfolio narrative: the graceful error-banner +
+retry UX documented in spec 005 screenshot 04 becomes a lie when Retry
+itself fails. Same failure pattern as the stale-deploy in § 8.1 —
+"the design is in the code, but the live experience is broken".
+
+**Root cause**: `AsyncPostgresSaver` checkpoints state per superstep.
+When the LLM emits an `AIMessage(tool_calls=[X, Y, ...])`, that message
+commits before the tools node starts. If the client disconnects or the
+stream drops during tool execution, `asyncio.CancelledError` propagates
+up through `astream_events`, cancelling in-flight tool coroutines. The
+checkpointer's state now contains an `AIMessage` with pending
+`tool_calls` but no matching `ToolMessage` entries.
+
+LLM providers (Groq/OpenAI-style) validate that every `tool_call.id` in
+an AIMessage has a corresponding `ToolMessage` with `tool_call_id`
+before accepting the next inference. Orphan tool_calls → the provider
+rejects the payload with `INVALID_CHAT_HISTORY`, and the session is
+poisoned until the user manually starts a new conversation.
+
+**Fix** (`src/matchday_agent/app.py`):
+
+- Added `_repair_orphan_tool_calls(agent, config)` helper.
+- Walks state backwards from the most recent message to find the last
+  `AIMessage` with `tool_calls`. Any earlier `AIMessage` with pending
+  tool_calls would have already blocked the graph from reaching this
+  state, so only the tail matters.
+- For that AIMessage, computes `resolved_ids` by scanning forward for
+  `ToolMessage.tool_call_id` values, then identifies `pending` calls
+  that were never resolved.
+- If pending, injects synthetic `ToolMessage(content="[interrupted
+  before completion]", tool_call_id=...)` for each via
+  `agent.aupdate_state(config, {"messages": synthetic})`. The
+  `add_messages` reducer on `MessagesState` appends without rerunning
+  the graph.
+- Called at the start of BOTH `/chat` and `/chat/stream` (inside the
+  try block for streaming so any repair failure yields a consistent
+  `error` frame).
+
+**Contract preservation**: synthetic ToolMessages use string content
+matching the natural language style ("[interrupted before completion]"),
+so the LLM sees them like any other tool output and can gracefully
+inform the user. No SSE frame shape changes; no api-contract.md
+updates needed.
+
+**Trade-offs**:
+
+- The synthetic content is English; the SYSTEM_PROMPT mirror rule
+  handles user-language response. If a future consumer needs localized
+  bracket strings, extend the helper to pass a locale.
+- If the checkpointer itself is unreachable (`aget_state` raises),
+  the request fails visibly. Acceptable — the whole agent depends on
+  the checkpointer, so a repair failure at read time indicates the
+  request would fail anyway.
+- No logging or metric emission in this pass. Adding a LangSmith trace
+  tag on repair events would be a nice observability upgrade for
+  spec 007 (traces-linked-per-turn) if useful.
+
+**Frontend defense-in-depth (delegated to matchday-mcp-web)**: even
+with the backend repair, a belt-and-suspenders frontend rotation of
+`X-Session-Id` on N=2 consecutive `INVALID_CHAT_HISTORY` errors was
+scoped out to the spec 006 chat's follow-up pass. Won't be needed in
+99% of cases post-repair; catches residual edge cases (e.g., the
+repair itself fails due to a partial write partway through
+`aupdate_state`).
+
+**Rule of thumb applied**: this is § 8.6 in action. Spec 006 chat's
+live probe surfaced a real user-visible bug that no local test would
+have caught (requires an actual mid-stream drop against Fly.io HTTP/2).
+Fixing it BEFORE moving to the next feature (spec 007 observability)
+preserves the narrative arc — same policy that drove the § 8.1
+stale-deploy fix before feature work.
+
