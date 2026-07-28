@@ -23,6 +23,7 @@ from typing import Any, cast
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from groq import RateLimitError as GroqRateLimitError
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -31,7 +32,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from sse_starlette.sse import EventSourceResponse
-from starlette.status import HTTP_400_BAD_REQUEST
+from starlette.status import HTTP_400_BAD_REQUEST, HTTP_429_TOO_MANY_REQUESTS, HTTP_502_BAD_GATEWAY
 
 from matchday_agent import __version__
 from matchday_agent.graph import build_agent
@@ -121,6 +122,27 @@ def _summarize_tool_output(output: Any) -> str:
     if len(text) > _TOOL_RESULT_SUMMARY_CHARS:
         return text[:_TOOL_RESULT_SUMMARY_CHARS] + "..."
     return text
+
+
+def _format_error_frame(exc: BaseException) -> dict[str, str]:
+    """Convert an exception into a user-friendly error frame payload.
+
+    Shared shape across `/chat` (JSON HTTPException body) and `/chat/stream`
+    (SSE `error` frame data). Special-cases known upstream provider errors
+    (Groq TPD RateLimitError) to friendlier code + message; falls back to
+    `type(exc).__name__` + `str(exc)` for unknown exceptions so debugging
+    stays cheap without leaking raw nested provider JSON to portfolio
+    demos. Documented in decisions.md § 8.8.
+    """
+    if isinstance(exc, GroqRateLimitError):
+        return {
+            "code": "RateLimit",
+            "message": (
+                "Daily token quota reached on the free tier. Try again in "
+                "~15 minutes or upgrade to a paid Groq tier."
+            ),
+        }
+    return {"code": type(exc).__name__, "message": str(exc)}
 
 
 async def _repair_orphan_tool_calls(agent: Any, config: dict[str, Any]) -> None:
@@ -232,11 +254,20 @@ async def chat(
     session_id = _validate_session_id(x_session_id)
     agent = request.app.state.agent
     config: dict[str, Any] = {"configurable": {"thread_id": session_id}}
-    await _repair_orphan_tool_calls(agent, config)
-    result = await agent.ainvoke(
-        {"messages": [HumanMessage(content=body.message)]},
-        config=config,
-    )
+    try:
+        await _repair_orphan_tool_calls(agent, config)
+        result = await agent.ainvoke(
+            {"messages": [HumanMessage(content=body.message)]},
+            config=config,
+        )
+    except Exception as exc:
+        error = _format_error_frame(exc)
+        status = (
+            HTTP_429_TOO_MANY_REQUESTS
+            if isinstance(exc, GroqRateLimitError)
+            else HTTP_502_BAD_GATEWAY
+        )
+        raise HTTPException(status_code=status, detail=error) from exc
     final_msg = result["messages"][-1]
     text = extract_chunk_text(final_msg)
     return ChatResponse(message=text, session_id=session_id, sources=[])
@@ -309,8 +340,8 @@ async def _sse_events(
             "event": "final",
             "data": json.dumps({"message": "".join(accumulated), "sources": []}),
         }
-    except Exception as e:
+    except Exception as exc:
         yield {
             "event": "error",
-            "data": json.dumps({"code": type(e).__name__, "message": str(e)}),
+            "data": json.dumps(_format_error_frame(exc)),
         }

@@ -2386,3 +2386,90 @@ Fixing it BEFORE moving to the next feature (spec 007 observability)
 preserves the narrative arc — same policy that drove the § 8.1
 stale-deploy fix before feature work.
 
+## 8.8 — Error frame consistency + Groq RateLimitError friendly framing
+
+**Two deltas surfaced by the post-spec-006 follow-up chat (frontend
+safety-net + npm audit pass):**
+
+1. **Cosmetic (P3)**: `groq.RateLimitError` (TPD hit at ~100k
+   tokens/day on the free tier) surfaced as raw nested JSON in the
+   user-visible error bubble — `{'error': {'message': ..., 'type':
+   'tokens', 'code': 'rate_limit_exceeded'}}`. Perfectly parseable by
+   the frontend's matcher (specifically verified: matcher did NOT
+   false-positive-rotate on this shape — see the safety-net chat's
+   screenshot 08), but reads noisy on portfolio demos.
+2. **Pre-existing gap (P2)**: `/chat` non-streaming endpoint had no
+   try/except around `agent.ainvoke()`. Any provider exception —
+   Groq `RateLimitError`, network errors, LangGraph internal errors —
+   escaped as FastAPI's default plaintext `Internal Server Error`
+   500. Discovered during verification of the § 8.7 fix when a
+   Spanish probe hit Groq TPD. `/chat/stream` (the primary frontend
+   path) already wrapped everything in try/except and yielded `error`
+   SSE frames cleanly.
+
+**Fix** (`src/matchday_agent/app.py`):
+
+- Added `_format_error_frame(exc)` shared helper that returns
+  `{code, message}` dict for any exception. Special-cases
+  `GroqRateLimitError` to `{"code": "RateLimit", "message": "Daily
+  token quota reached on the free tier. Try again in ~15 minutes or
+  upgrade to a paid Groq tier."}`. Falls back to
+  `{"code": type(exc).__name__, "message": str(exc)}` for unknown
+  exceptions — debuggability preserved, provider JSON never leaks.
+- Wrapped `/chat` non-streaming in try/except using the helper.
+  Raises `HTTPException(status_code=..., detail=<error>)` where
+  status is `429 Too Many Requests` for `RateLimitError`, `502 Bad
+  Gateway` for everything else. FastAPI serializes `detail` as JSON
+  body, so response shape becomes
+  `{"detail": {"code": ..., "message": ...}}` — structured and
+  parseable, unlike the previous plaintext 500.
+- Refactored `/chat/stream` `except Exception` clause to call the
+  same helper. Frame data shape unchanged (`{code, message}`),
+  just now goes through one code path for both endpoints.
+- Direct `from groq import RateLimitError as GroqRateLimitError`
+  import at module top. `groq` was already a transitive dep via
+  `langchain-groq` (which we require as the default provider), so
+  no dependency changes needed.
+
+**Contract impact**:
+
+- `/chat/stream` error frame shape unchanged (`{code, message}`) —
+  api-contract.md needs no update.
+- `/chat` non-streaming error shape CHANGED (plaintext 500 →
+  structured JSON with `detail: {code, message}`). Not a breaking
+  change for real consumers — no client parses "Internal Server
+  Error" plaintext. Frontend uses `/chat/stream` exclusively;
+  `/chat` is used by evals + tests only.
+
+**Trade-offs**:
+
+- Hard dep on `groq` package. Already transitive, so this just
+  makes it explicit. If a future provider swap removes langchain-groq
+  entirely, this import would need to be wrapped or moved to a
+  provider-specific error handler module.
+- Static friendly message for RateLimit (doesn't parse Groq's exact
+  `retry-after Xm Ys` from the exception). Could be improved by
+  extracting `exc.response.headers.get("retry-after")` — deferred as
+  a nice-to-have. Users get "~15 minutes" as a rough estimate; if
+  they need precise timing, the raw retry logic in the SDK still
+  works.
+- Providers other than Groq (currently only `google_genai` supported)
+  would have their own rate-limit exception types. When we add
+  Gemini's `ResourceExhausted` to the matcher, extend
+  `_format_error_frame` with an `elif`. Not eagerly registered
+  because Gemini paid tier hasn't hit rate limits in testing yet.
+
+**Rule of thumb**: error frame consistency between endpoints is a
+debuggability + UX concern that should live in ONE helper, not
+duplicated per endpoint. When adding a third endpoint (or a
+provider-specific error handler), route it through the same
+helper — else drift will re-introduce the raw-JSON leak this fix
+just closed.
+
+Third consecutive application of § 8.6 "live probe = mandatory
+phase-close signal": the frontend safety-net chat's live probe
+accidentally verified the matcher specificity by hitting Groq TPD
+mid-test. That verification incidentally surfaced the raw JSON
+noise, closing the loop from delta observation to root-cause fix
+in one pass.
+
