@@ -19,11 +19,11 @@ Post history / cross-refs (per spec 004 Phase 7):
 
 ### Description field — Spanish (~200 chars)
 
-> Agente football-analyst end-to-end en Python: LangGraph + Wikipedia RAG sobre Supabase pgvector + observabilidad LangSmith + streaming SSE. Orquesta matchday-mcp (npm) y responde en español. Deploy en Fly.io.
+> Agente football-analyst end-to-end en Python: LangGraph + Wikipedia RAG sobre Supabase pgvector + observabilidad LangSmith + streaming SSE. Orquesta matchday-mcp (npm) y responde en el idioma del usuario (default: inglés). Deploy en Fly.io.
 
 ### Description field — English (~200 chars)
 
-> End-to-end football-analyst agent in Python: LangGraph + Wikipedia RAG on Supabase pgvector + LangSmith tracing + SSE streaming. Orchestrates matchday-mcp (npm), answers in Spanish. Deployed on Fly.io.
+> End-to-end football-analyst agent in Python: LangGraph + Wikipedia RAG on Supabase pgvector + LangSmith tracing + SSE streaming. Orchestrates matchday-mcp (npm), responds in the user's language (default: English). Deployed on Fly.io.
 
 ### URL
 
@@ -182,11 +182,12 @@ What you can do RIGHT NOW from your terminal:
     curl -N -X POST https://matchday-agent.fly.dev/chat/stream \
       -H 'Content-Type: application/json' \
       -H "X-Session-Id: $UUID" \
-      -d '{"message":"Compará Real Madrid vs Barcelona esta temporada"}'
+      -d '{"message":"Compare Real Madrid vs Barcelona this season"}'
 
 You'll see 3 parallel tool_calls (compare_teams + find_team ×2), then
-streaming Spanish tokens, then a final. In ~2.5 seconds with a warm
-machine; ~20s cold-start from stopped.
+streaming English tokens, then a final. In ~2.5 seconds with a warm
+machine; ~20s cold-start from stopped. Ask in Spanish/Portuguese/French
+and the agent mirrors your language — no forcing.
 
 The deploy was not trivial:
 

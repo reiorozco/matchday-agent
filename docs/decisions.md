@@ -2041,3 +2041,122 @@ Two low outliers do NOT threaten the baseline claim — the aggregate is
 4.27 across 15, well above the 3.77 regression fail line. But they're
 useful signal for future prompt-tuning work (Phase 8+ if any).
 
+---
+
+## 4.14 — Language pivot: agent English-default with user-language mirror
+
+Snapshot: 2026-07-27 late (post § 4.13 baseline). Portfolio positioning
+correction: agent was forced to Spanish in the original SYSTEM_PROMPT,
+mismatching the user's own `marca-profesional-2026` framing ("Mercado:
+US + LATAM remoto. Idioma base inglés"). Fixed by removing the forcing
+rule + rewriting the anchor cases in English.
+
+### 4.14.1 — Three code changes to pivot the agent
+
+1. **`src/matchday_agent/prompts/system.py`** — SYSTEM_PROMPT rewritten:
+   - Header docstring: "Output language: English by default; mirrors
+     user's language natively"
+   - `# Response language` section: "Respond in English by default. If
+     the user writes to you in another language, mirror their language
+     naturally in your response." (Removed the old "ALWAYS respond in
+     Spanish" forcing rule.)
+   - Coverage guide examples translated to English (`"how is X arriving
+     to el Clásico"`, `"which league is most contested"`, etc.).
+   - Citation format documented as dual: `(source: X)` in English
+     responses, `(fuente: X)` when the agent mirrors to Spanish. Pick
+     the label that matches your response language.
+
+2. **`evals/anchor_cases.jsonl`** — all 15 examples rewritten in English:
+   - Queries translated with 3 phrasing tiers preserved
+     (formal / casual / elliptical) — same test coverage of prompt
+     robustness across query styles.
+   - Reference summaries in English with `(source: X)` citations.
+   - `expected_tools[]` unchanged (tool names are immutable).
+   - Loan words preserved when idiomatic in English tech/sports writing
+     ("el Clásico", "LaLiga", "Ligue 1").
+
+3. **`src/matchday_agent/evals/runner.py`** — `DATASET_NAME` renamed
+   from `matchday-agent-anchor-cases` to
+   `matchday-agent-anchor-cases-en`. Forces a fresh dataset upload in
+   LangSmith (the runner reads the hosted dataset, not the local JSONL;
+   without the rename, the eval would keep using the cached Spanish
+   examples). The original Spanish dataset is **preserved** in the
+   LangSmith UI as historical evidence of the § 4.13 baseline; the
+   `-en` variant is the new canonical.
+
+### 4.14.2 — English baseline vs Spanish baseline (2026-07-27 comparison)
+
+| Metric                       | Spanish (§ 4.13) | English (§ 4.14) | Delta        |
+|------------------------------|-----------------:|-----------------:|-------------:|
+| correctness (mean, 1-5)      | **4.27**         | **3.53**         | -0.74 (-17%) |
+| tool_selection (mean, 0-1)   | **0.92**         | **0.88**         | -0.04 (-4%)  |
+| latency p50 ms               | 10 154           | 9 053            | -1 101 (-11%)|
+| latency p95 ms               | 26 893           | 20 752           | -6 141 (-23%)|
+
+**Score distribution**:
+
+- Spanish 4.27: 11× score 5, 1× score 4, 1× score 3, 2× score 1 (case2_v3 + case4_v2 outliers).
+- English 3.53: 7× score 5, 3× score 4, 1× score 3, 3× score 1 (case5_v1 + case5_v2 + case4_v2), 1× score 0 (case1_v3 judge_error).
+
+**Delta root-cause analysis** (from log inspection + score comparison):
+
+- **case5_v1 + case5_v2 (laliga_weekend_summary): regressed 5 → 1 each.**
+  The English reference specifies exact match examples ("Barça 3-0 Mallorca,
+  Real Madrid 1-0 Osasuna, Villarreal 2-0 Real Oviedo"). The Gemini judge
+  in English space appears to require exact match reproduction from the
+  agent's output, and the agent naturally returned different recent-matchday
+  results from the live API — scored 1 for "wrong stats". The Spanish
+  baseline judge was more lenient on this specificity in the previous
+  run. Fixable by softening the reference to "recent matchday results
+  (specific matches vary with the live API)".
+- **case1_v3 (arriving_to_clasico, elliptical): scored 0.** Judge error
+  code path — likely Gemini judge returned invalid JSON (markdown fence
+  edge case not caught by `_parse_judge_json`, or content shape variance).
+  Not tied to language — same judge_error can hit any case; case1_v3
+  happened to draw the short straw this run.
+- **case4_v2 (most_contested_league, casual): 1.** Same failure mode as
+  in Spanish baseline — the casual phrasing "which league is the most
+  competitive" doesn't reliably trigger the parallel-tool-calls rule.
+  Prompt tuning target for both language spaces.
+
+**Interpretation**: the 3.53 English baseline is the honest anchor for
+future comparisons. The 4.27 Spanish baseline is historical evidence
+of the pre-pivot state, NOT a target to match — the two live in
+different reference spaces and are not directly comparable.
+
+### 4.14.3 — Regression threshold updated for English space
+
+- **English baseline anchor**: correctness_mean = **3.53**.
+- **Regression fail line**: any future English run whose correctness_mean
+  drops by more than 0.5 (i.e. below **3.03**) should fail CI in Phase 6+.
+- **Improvement targets** (Phase 8+ optional prompt-tuning):
+  - Soften case5 references to lift `laliga_weekend_summary` from 1 → 4+.
+  - Investigate case1_v3 judge_error robustness (may need `_parse_judge_json`
+    hardening for Gemini's markdown edge cases).
+  - Add a "casual phrasing" reminder in the coverage guide for the
+    parallel-tool-calls rule (fixes case4_v2 in both language spaces).
+
+### 4.14.4 — Cost accounting for the pivot
+
+| Iteration                                    | Wall clock | Est cost |
+|----------------------------------------------|-----------:|---------:|
+| system.py + anchor_cases.jsonl rewrite       | manual     | $0       |
+| Full 15-case English baseline capture        | 2 m 10 s   | ~$0.05   |
+| (Sum with § 4.11-4.13 iterations)            | ~9 min     | ~$0.19   |
+
+$10 Gemini credit remaining after the pivot: **~$9.81** (~196 baselines
+of headroom for future iteration).
+
+### 4.14.5 — Rule of thumb: language-force removal is portfolio-cheap, high-value
+
+The original spec 004 assumed a Spanish default because the user is
+Colombian. The `marca-profesional-2026` memory file explicitly stated
+the opposite target ("Idioma base inglés" for US + LATAM remote job
+market). This drift went unquestioned for 7 phases.
+
+**Rule of thumb**: for any portfolio project, verify the "who reads this
+first" audience upfront. Force-language rules are a debt if they mismatch
+the audience — cheap to fix mid-project (this took ~20 min + $0.05),
+expensive to defend during a job interview if a US recruiter can't test
+the demo in English without asking.
+

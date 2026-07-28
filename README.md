@@ -1,6 +1,6 @@
 # matchday-agent
 
-Football-analyst agent that orchestrates the [`matchday-mcp`](https://github.com/reiorozco/matchday-mcp) server + Wikipedia RAG, streams reasoning over SSE, and persists conversation state in Supabase Postgres. Answers in Spanish. Deployed on Fly.io.
+Football-analyst agent that orchestrates the [`matchday-mcp`](https://github.com/reiorozco/matchday-mcp) server + Wikipedia RAG, streams reasoning over SSE, and persists conversation state in Supabase Postgres. Responds in English by default and mirrors the user's language when queried in Spanish, Portuguese, French, etc. Deployed on Fly.io.
 
 **Live**: <https://matchday-agent.fly.dev> · **OpenAPI**: <https://matchday-agent.fly.dev/openapi.json> · **License**: MIT
 

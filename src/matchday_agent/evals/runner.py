@@ -40,7 +40,7 @@ from matchday_agent.streaming import extract_chunk_text
 from matchday_agent.tools.mcp_tools import MissingCredentialError, matchday_mcp_tools
 from matchday_agent.tools.rag import search_football_context
 
-DATASET_NAME = "matchday-agent-anchor-cases"
+DATASET_NAME = "matchday-agent-anchor-cases-en"
 EXPERIMENT_PREFIX = "matchday-agent-phase4"
 MAX_CONCURRENCY = 2
 BASELINE_PATH = Path("evals/baseline.md")

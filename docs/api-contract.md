@@ -64,7 +64,7 @@ Constraints: `1 <= len(message) <= 4000`.
 
 ```json
 {
-  "message": "El Real Madrid marcha 2° en LaLiga con 86 puntos (fuente: get_standings).",
+  "message": "Real Madrid sits 2nd in LaLiga with 86 points (source: get_standings).",
   "session_id": "<echoed X-Session-Id>",
   "sources": []
 }
@@ -73,7 +73,7 @@ Constraints: `1 <= len(message) <= 4000`.
 **v1 note — `sources: []`**: always empty in v1. Phase 4 will populate it
 with structured cited-source entries `[{"kind": "tool" | "rag", "tool": "...", "url": "..."}]`
 from tool calls and RAG hits. Until then, the frontend can inline-parse the
-`(fuente: X)` markers embedded in `message`.
+`(source: X)` markers embedded in `message` (label switches to `(fuente: X)` when the agent mirrors a Spanish query).
 
 **Reserved for Phase 4+**:
 - `usage: {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N}` —
