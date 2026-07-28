@@ -1,8 +1,10 @@
 """Three evaluators for Phase 4 evals.
 
 - correctness: Gemini LLM-as-judge, scores 1-5 vs reference_summary
-- tool_selection: set overlap between actually-called tools (via
-  run.child_runs) and expected_tools (via reference_outputs)
+- tool_selection: set overlap between actually-called tools and expected_tools.
+  Prefers the pre-extracted `called_tools` list in `outputs` (populated by
+  the runner from `result["messages"]`) — child_runs / outputs.messages
+  fallbacks are unreliable across provider shapes.
 - latency_ms: wall-clock ms from run.start_time to run.end_time
 """
 
@@ -15,6 +17,7 @@ from langchain.chat_models import init_chat_model
 from langsmith.schemas import Run
 
 from matchday_agent.evals.judge_prompt import JUDGE_MODEL_ID, JUDGE_PROMPT_TEMPLATE
+from matchday_agent.streaming import extract_chunk_text
 
 _KNOWN_TOOL_NAMES: set[str] = {
     "get_standings",
@@ -27,12 +30,28 @@ _KNOWN_TOOL_NAMES: set[str] = {
 }
 
 
-def _extract_called_tools(run: Run) -> set[str]:
-    """Extract tool names called during a run via run.child_runs.
+def extract_called_tools_from_messages(messages: list[Any]) -> set[str]:
+    """Extract tool names invoked from a list of LangChain messages.
 
-    Fallback: inspect the messages inside run.outputs if child_runs is
-    empty (some LangGraph configurations don't expose child_runs at
-    evaluator time).
+    Handles both live BaseMessage objects (LangGraph result) and dicts
+    (post-LangSmith-serialization). Used by both the runner's `target()`
+    (to pre-extract for evaluator handoff) and the `tool_selection`
+    evaluator's fallback.
+    """
+    called: set[str] = set()
+    for msg in messages:
+        name = msg.get("name") if isinstance(msg, dict) else getattr(msg, "name", None)
+        if isinstance(name, str) and name in _KNOWN_TOOL_NAMES:
+            called.add(name)
+    return called
+
+
+def _extract_called_tools(run: Run) -> set[str]:
+    """Fallback: extract tool names from run.child_runs or run.outputs.
+
+    Used only when the target's `called_tools` list is missing from
+    outputs (defensive — LangSmith serialization can drop nested lists
+    in edge cases).
     """
     called: set[str] = set()
     for child in run.child_runs or []:
@@ -43,11 +62,7 @@ def _extract_called_tools(run: Run) -> set[str]:
         return called
     outputs = run.outputs or {}
     messages = outputs.get("messages") or []
-    for msg in messages:
-        name = getattr(msg, "name", None)
-        if isinstance(name, str) and name in _KNOWN_TOOL_NAMES:
-            called.add(name)
-    return called
+    return extract_called_tools_from_messages(messages)
 
 
 def _parse_judge_json(text: str) -> dict[str, Any]:
@@ -75,19 +90,19 @@ async def correctness_evaluator(
     )
     try:
         response = await judge.ainvoke(prompt)
-        content = response.content if isinstance(response.content, str) else str(response.content)
+        content = extract_chunk_text(response)
         parsed = _parse_judge_json(content)
         raw_score = parsed.get("score", 0)
         score = int(raw_score) if isinstance(raw_score, (int, float)) else 0
         score = max(1, min(5, score)) if score > 0 else 0
         return {
-            "key": "correctness",
+            "key": "correctness_1_5",
             "score": score,
             "comment": str(parsed.get("reasoning", ""))[:200],
         }
     except Exception as e:
         return {
-            "key": "correctness",
+            "key": "correctness_1_5",
             "score": 0,
             "comment": f"judge error: {type(e).__name__}: {e}",
         }
@@ -98,8 +113,18 @@ async def tool_selection_evaluator(
     reference_outputs: dict[str, Any],
     run: Run,
 ) -> dict[str, Any]:
-    """Set overlap of actually-called tools vs expected_tools."""
-    called = _extract_called_tools(run)
+    """Set overlap of actually-called tools vs expected_tools.
+
+    Prefers `outputs["called_tools"]` populated by the runner (reliable
+    across provider content shapes); falls back to `_extract_called_tools`
+    on child_runs / outputs.messages only if the pre-extracted list is
+    missing.
+    """
+    called_from_outputs = outputs.get("called_tools")
+    if isinstance(called_from_outputs, list):
+        called = {t for t in called_from_outputs if isinstance(t, str)}
+    else:
+        called = _extract_called_tools(run)
     expected_raw = reference_outputs.get("expected_tools") or []
     expected = set(expected_raw) if isinstance(expected_raw, list) else set()
     if not expected:

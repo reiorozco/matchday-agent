@@ -1859,3 +1859,185 @@ closing notes for the user to sync manually.
 outside the immediate work context — they encode the user's
 private framing of their portfolio, not just the technical state.
 
+---
+
+# Phase 4 finale — Real baseline captured (2026-07-27 evening)
+
+Snapshot date: 2026-07-27. **Real quantitative baseline finally captured**
+after 4 attempts across 2 days. Config: agent + judge both
+`google_genai:gemini-flash-latest` (paid tier, $10 credit added by user
+after Groq Dev Tier showed "temporarily unavailable due to high demand").
+Aggregate scores: **correctness_mean=4.27 / 5**, **tool_selection_mean=0.92**,
+latency p50=10.15s, p95=26.89s across all 15 anchor cases (5 cases ×
+3 phrasings). Regression threshold now enforceable at correctness_mean drop
+> 0.5 → fail (i.e. drop below 3.77). Baseline in `evals/baseline.md`;
+LangSmith experiment `matchday-agent-phase4` has all 15 traces uploaded
+cleanly (no more feedback config 400s). Full closing notes with runtime
+evidence live in the spec (`~/Dev/matchday-mcp/specs/004-langgraph-agent.md
+§ Phase 4 finale`); this section is the source of truth for the eval-infra
+fixes that unblocked the capture.
+
+---
+
+## 4.11 — Three eval-infra bugs fixed to unblock Gemini agent + judge
+
+The Gemini-only capture path (forced when Groq Dev Tier was unavailable +
+user upgraded Gemini to paid) surfaced 3 latent bugs in the eval infra
+that only manifest when the agent's content shape is `list[dict]` (Gemini
+3.x with `extras.signature`) instead of `str` (Groq):
+
+### 4.11.1 — `correctness_evaluator` couldn't parse judge output on Gemini
+
+**Symptom**: all 15 cases returned `correctness_score=0` on the first
+agent+judge=Gemini run, despite the agent producing perfectly valid
+Spanish responses (verified via a standalone diag script).
+
+**Root cause**: `evaluators.py::correctness_evaluator` did:
+
+```python
+content = response.content if isinstance(response.content, str) else str(response.content)
+```
+
+For Gemini responses, `response.content` is `list[dict]` (`[{'type':
+'text', 'text': '{"score": 4, ...}', 'extras': {...}}]`). `str(...)` on
+a list produces Python repr (`"[{'type': 'text', ...}]"`), NOT the
+extracted text — so `json.loads(...)` throws `JSONDecodeError`, caught
+in the except handler, returned as `{"score": 0, "comment": "judge
+error: ..."}`.
+
+**Fix**: use `matchday_agent.streaming::extract_chunk_text` which
+already handles both `str` (Groq) and `list[dict]` (Gemini) shapes —
+the same helper the CLI + SSE emitter use for streaming chunks.
+
+**Rule of thumb**: any code that reads `AIMessage.content` from
+`init_chat_model` MUST route through `extract_chunk_text` or an
+equivalent shape-normalizer. The `str()` fallback is a footgun on
+provider swaps.
+
+### 4.11.2 — `tool_selection_evaluator` couldn't find tool names via `run.child_runs`
+
+**Symptom**: `tool_selection=0.00` for all cases (both agent=Groq and
+agent=Gemini) — even when the agent clearly invoked multiple tools.
+
+**Root cause**: `evaluators.py::_extract_called_tools` reads
+`run.child_runs` — but LangSmith's async run tree does NOT reliably
+populate `child_runs` at evaluator-time. The fallback tried
+`run.outputs.get("messages")`, but the runner's `target()` was returning
+only `{"output": text}` — no messages list. Both paths returned empty.
+
+**Fix**: `target()` now pre-extracts the called tool names from
+`result["messages"]` via a shared helper
+(`extract_called_tools_from_messages`, in `evaluators.py`) and returns
+`{"output": text, "called_tools": [...]}`. Evaluator prefers this
+explicit list; falls back to `run.child_runs` only if missing.
+
+**Rule of thumb**: pass evaluator-relevant data through `target()`'s
+return dict — do NOT rely on LangSmith's ability to reconstruct it from
+`Run` object hierarchy after the fact. The `Run` shape is opaque and
+provider-dependent.
+
+### 4.11.3 — LangSmith feedback config for `correctness` key had `max=1`
+
+**Symptom**: `Failed to send compressed multipart ingest: ... 400 Bad
+Request ... 'invalid feedback config: feedback score 5 is greater than
+maximum 1'`. Every run tried to upload correctness scores in the 1-5
+range and got server-rejected — LangSmith UI wouldn't show any
+correctness scores, though local baseline.md aggregation was correct.
+
+**Root cause**: an earlier attempt (probably one of the Phase 4 initial
+runs) auto-created a LangSmith feedback config for the key `correctness`
+with `max=1` (from the tool_selection or latency scale). Once the config
+exists on LangSmith side, it's sticky per-key across projects — every
+subsequent upload with `key="correctness"` and `score>1` gets rejected.
+
+**Fix**: rename evaluator key from `correctness` to `correctness_1_5`.
+LangSmith auto-creates a fresh feedback config for the new key with
+whatever range the first upload uses. Runner's `_collect_results`
+aggregation updated to match the new key.
+
+**Rule of thumb**: LangSmith feedback configs are sticky per-key.
+Include the score range in the key name (`correctness_1_5`,
+`tool_selection_0_1`) to lock the semantics and avoid config conflicts
+after any scale change. Renaming is the safe path; deleting the config
+requires UI access.
+
+---
+
+## 4.12 — Baseline capture: same-provider Gemini rationale + cost
+
+Config for the baseline that stuck:
+
+- **Agent**: `google_genai:gemini-flash-latest` (resolves to
+  `gemini-3.6-flash` today; alias per § 0.1 escape hatch).
+- **Judge**: same — `google_genai:gemini-flash-latest`.
+
+Same-provider was NOT the originally-designed setup (§ 4.1 chose
+Gemini judge specifically to avoid Groq self-judging bias). Forced
+here because Groq Dev Tier upgrade showed "temporarily unavailable
+due to high demand" the day the user tried to buy it. User added $10
+Gemini credit as the working alternative.
+
+**Self-judging bias risk documented but acceptable at this scope**:
+
+- Reference summaries are hand-written (§ 4.5), NOT self-generated —
+  the judge compares agent output against a human-defined gold, not
+  against another Gemini-generated response. The classic self-judging
+  bias failure mode (judge scores its own family of outputs higher
+  than another provider's) doesn't apply when the reference is
+  independent.
+- The bias would matter if we were benchmarking Gemini agent VS Groq
+  agent under the same judge. Here we're measuring "does this
+  agent produce responses that match hand-written references + call
+  the expected tools?" — self-consistency doesn't distort that.
+- Regression threshold (correctness_mean drop > 0.5) is robust to
+  the small drift this scale of same-provider evaluation introduces.
+
+**Cost accounting for the successful capture**:
+
+| Iteration | Wall clock | Est cost |
+|---|---:|---:|
+| Attempt 1 today: agent=Gemini full 15 (bugged eval infra) | 2 m 13 s | ~$0.05 |
+| --limit 5 verify after fixes | 43 s | ~$0.02 |
+| --limit 5 re-verify after key rename | 57 s | ~$0.02 |
+| **Successful full 15 baseline** | **2 m 15 s** | **~$0.05** |
+| Diagnostic single-case script | 14 s | ~$0.001 |
+| Groq probe + earlier Gemini probes | — | ~$0.001 |
+| **Total for the whole 2026-07-27 evening** | ~6 min | **~$0.14** |
+
+$10 Gemini credit → ~$9.86 remaining → ~200 more baseline runs of
+headroom if we ever want to iterate references or add cases.
+
+**Downgrade path**: user can remove GCP billing method at any time to
+revert to free tier limits. No subscription, no ongoing cost.
+
+**Rule of thumb**: when free-tier quota reality bites AND paid tier is
+cheap (< $1 per operation), just pay for the one-shot. The
+alternative — waiting days for rolling windows to reset — is worth
+more than $0.05 in engineering time.
+
+---
+
+## 4.13 — Regression threshold locked at 4.27 baseline
+
+Any future eval run whose `correctness_mean` drops by more than 0.5
+below **4.27** (i.e. below **3.77**) should fail CI when Phase 6+ adds
+CI enforcement. Corresponding tool_selection floor: **0.42** (below
+which triggers investigation, per § 4 spec exit criterion drift
+allowance).
+
+**Interesting outliers to investigate in future prompt tuning**:
+
+- `case2_v3` (next_match_analysis, phrasing #3): scored **1/5**
+  correctness. Cases 2_v1 and 2_v2 both scored 5 — v3 phrasing
+  triggered a specific failure mode worth checking (maybe the model
+  gave up early on the empty-fixture data path).
+- `case4_v2` (most_contested_league, phrasing #2): scored **1/5**.
+  4_v1 and 4_v3 scored 5 and 3 respectively — inconsistent handling
+  of the parallel-standings comparison across phrasings.
+- Rest of cases: solidly 4-5 correctness with 0.67-1.0 tool_selection.
+  System prompt behavior is stable across most anchor coverage.
+
+Two low outliers do NOT threaten the baseline claim — the aggregate is
+4.27 across 15, well above the 3.77 regression fail line. But they're
+useful signal for future prompt-tuning work (Phase 8+ if any).
+

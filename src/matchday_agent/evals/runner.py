@@ -30,6 +30,7 @@ from langsmith.utils import LangSmithNotFoundError
 from matchday_agent.evals.dataset import load_examples
 from matchday_agent.evals.evaluators import (
     correctness_evaluator,
+    extract_called_tools_from_messages,
     latency_evaluator,
     tool_selection_evaluator,
 )
@@ -117,7 +118,7 @@ async def _collect_results(
             if score is None:
                 continue
             score_f = float(score)
-            if key == "correctness":
+            if key == "correctness_1_5":
                 row["correctness"] = score_f
                 correctness_scores.append(score_f)
             elif key == "tool_selection":
@@ -241,7 +242,8 @@ async def _amain(limit: int | None = None) -> int:
             )
             final_msg = result["messages"][-1]
             text = extract_chunk_text(final_msg)
-            return {"output": text}
+            called_tools = sorted(extract_called_tools_from_messages(result["messages"]))
+            return {"output": text, "called_tools": called_tools}
 
         print(f"\n[startup] running aevaluate (max_concurrency={MAX_CONCURRENCY})...\n", flush=True)
         results = await aevaluate(
