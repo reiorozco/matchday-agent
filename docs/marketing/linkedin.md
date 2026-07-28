@@ -52,8 +52,8 @@ El stack:
 
 - Ingest: Wikipedia-API 0.15 sobre 68 URLs (20 clubes de LaLiga + 20 de Premier
   League + 10 finales/derbies famosos), en ES + EN
-- Embedder: intfloat/multilingual-e5-large (1024d, MIT) via fastembed —
-  ONNX local, sin API calls ni rate limits
+- Embedder: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  (384d, Apache-2.0) via fastembed — ONNX local, sin API calls ni rate limits
 - Chunker: RecursiveCharacterTextSplitter.from_tiktoken_encoder (480 tokens,
   overlap 64) — NO el default por caracteres
 - Store: Supabase pgvector con index HNSW cosine + register_vector_async
@@ -89,8 +89,8 @@ The stack:
 
 - Ingest: Wikipedia-API 0.15 across 68 URLs (20 LaLiga clubs + 20 Premier League
   clubs + 10 famous finals/derbies), in ES + EN
-- Embedder: intfloat/multilingual-e5-large (1024d, MIT) via fastembed —
-  local ONNX, no API calls, no rate limits
+- Embedder: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  (384d, Apache-2.0) via fastembed — local ONNX, no API calls, no rate limits
 - Chunker: RecursiveCharacterTextSplitter.from_tiktoken_encoder (480 tokens,
   overlap 64) — NOT the default character-based one
 - Store: Supabase pgvector with HNSW cosine index + register_vector_async

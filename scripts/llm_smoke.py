@@ -31,7 +31,10 @@ async def main() -> int:
     print(f"response: {text!r}")
 
     if not hasattr(llm, "bind_tools"):
-        print(f"FAIL: {model_id} does not support .bind_tools() — Phase 1 requires it", file=sys.stderr)
+        print(
+            f"FAIL: {model_id} does not support .bind_tools() — Phase 1 requires it",
+            file=sys.stderr,
+        )
         return 1
     print("tool-calling: supported")
     return 0

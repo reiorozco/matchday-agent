@@ -9,14 +9,14 @@ sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 (~220 MB,
 truncation) — the smallest multilingual embedder fastembed supports.
 Fits comfortably in the 1 GB VM (bumped per § 8.10 too).
 
-fastembed's passage_embed / query_embed helpers stay the same across
-models — for MiniLM they're aliases for the generic embed() call
-(no E5-style "passage: " / "query: " prefix needed).
-
 The `TextEmbedding` instance is a process-wide singleton — the smaller
 model loads in ~1-2 s. Pre-baked into the Docker image via a
 Dockerfile RUN step so cold starts don't re-download the ~220 MB
 weights.
+
+MODEL_DIM lives in db/schema.sql (as the vector(N) column type) rather
+than a Python constant, because that's the file a fresh contributor
+runs to reproduce the schema. Keep them in sync when swapping models.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ from threading import Lock
 from fastembed import TextEmbedding
 
 _MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-EMBEDDING_DIM = 384
 
 _model: TextEmbedding | None = None
 _model_lock = Lock()
@@ -45,7 +44,10 @@ def get_embedder() -> TextEmbedding:
 def embed_passages(texts: list[str], batch_size: int = 32) -> list[list[float]]:
     """Embed a batch of document/passage chunks for storage in pgvector.
 
-    fastembed injects the E5 "passage: " prefix internally via passage_embed.
+    `passage_embed` is fastembed's naming convention across all models.
+    For E5-family models it prepends "passage: "; for MiniLM (current
+    model) it's a passthrough to the generic `embed()` call. Either
+    way we don't inject prefixes by hand.
     """
     model = get_embedder()
     vectors = list(model.passage_embed(texts, batch_size=batch_size))
@@ -55,7 +57,9 @@ def embed_passages(texts: list[str], batch_size: int = 32) -> list[list[float]]:
 def embed_query(query: str) -> list[float]:
     """Embed a single user query for similarity search against passages.
 
-    fastembed injects the E5 "query: " prefix internally via query_embed.
+    `query_embed` mirrors `passage_embed`'s naming: E5 prepends
+    "query: ", MiniLM is a passthrough. We never inject by hand so
+    swapping models is transparent to this module's callers.
     """
     model = get_embedder()
     vectors = list(model.query_embed([query]))

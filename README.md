@@ -37,11 +37,11 @@ The agent mirrors your language — try `"message":"Compará Real Madrid vs Barc
 
 - **LangGraph 1.2** — ReAct agent via `create_react_agent(version="v2")` with an `AsyncPostgresSaver` checkpointer on the same Supabase project as the RAG corpus.
 - **7 tools** — 6 [`matchday-mcp`](https://github.com/reiorozco/matchday-mcp) tools bound over stdio (`get_standings`, `get_matches`, `get_top_scorers`, `find_team`, `get_team_matches`, `compare_teams`) + 1 in-repo RAG tool (`search_football_context`).
-- **RAG v1** — 2 400 chunks of Wikipedia across 68 URLs (LaLiga + Premier League clubs + famous rivalries / finals) embedded with `intfloat/multilingual-e5-large` (1024-d, MIT) into Supabase `pgvector`. HNSW cosine index.
-- **Zero-code provider swap** — `LLM_PROVIDER` env accepts `groq` (default, `llama-3.3-70b-versatile`) or `google_genai` (`gemini-3.5-flash`) via LangChain's `init_chat_model` factory. Empirically validated: no code path branches on provider.
-- **FastAPI + `sse-starlette`** — 5 endpoints, `slowapi` per-IP rate limit (20 req/min on POST endpoints), CORS pinned to the Vercel frontend origin.
+- **RAG v1** — 2 399 chunks of Wikipedia across 68 URLs (LaLiga + Premier League clubs + famous rivalries / finals) embedded with `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-d, Apache-2.0) into Supabase `pgvector`. HNSW cosine index. Swapped from `intfloat/multilingual-e5-large` (2.24 GB, 1024-d) after that model OOM-killed the 512 MB VM — full trade-off writeup in [decisions.md § 8.10](docs/decisions.md).
+- **Zero-code provider swap** — `LLM_PROVIDER` env accepts `groq` (default, `llama-3.3-70b-versatile`) or `google_genai` (`gemini-flash-latest`) via LangChain's `init_chat_model` factory. Empirically validated: no code path branches on provider.
+- **FastAPI + `sse-starlette`** — 5 endpoints, `slowapi` per-user rate limit (20 req/min via `Fly-Client-IP` header on POST endpoints; see [decisions.md § 8.11](docs/decisions.md)), CORS pinned to the Vercel frontend origin.
 - **LangSmith** — every request auto-traced with `session_id`, detected `use_case`, `model`, and `env` metadata (no code changes; env-driven).
-- **Fly.io** — single machine, `auto_stop_machines = 'stop'`, `shared-cpu-1x` / 512 MB. Cost-safe scale-to-zero (verified: auto-stop fires ≈ 4 min after last inbound request).
+- **Fly.io** — single machine, `auto_stop_machines = 'stop'`, `shared-cpu-1x` / 1 GB (bumped from 512 MB post-audit; see [decisions.md § 8.10](docs/decisions.md)). Cost-safe scale-to-zero (verified: auto-stop fires ≈ 4 min after last inbound request).
 
 ### Anchor use cases (v1 shipped)
 

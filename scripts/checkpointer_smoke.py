@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-import uuid
 from typing import Annotated, TypedDict
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -74,7 +73,10 @@ async def main() -> int:
         # Confirm persistence: re-read state fresh from Postgres.
         current = await app.aget_state(config)
         print(f"persisted state: {current.values}")
-        print(f"checkpoint id: {getattr(current, 'config', {}).get('configurable', {}).get('checkpoint_id', 'n/a')}")
+        checkpoint_id = (
+            getattr(current, "config", {}).get("configurable", {}).get("checkpoint_id", "n/a")
+        )
+        print(f"checkpoint id: {checkpoint_id}")
         return 0
 
 

@@ -41,28 +41,30 @@ async def main() -> int:
         env={"FOOTBALL_DATA_TOKEN": token},
     )
 
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
+    async with (
+        stdio_client(server_params) as (read, write),
+        ClientSession(read, write) as session,
+    ):
+        await session.initialize()
 
-            tools_result = await session.list_tools()
-            names = [t.name for t in tools_result.tools]
-            print(f"tools ({len(names)}): {', '.join(names)}")
+        tools_result = await session.list_tools()
+        names = [t.name for t in tools_result.tools]
+        print(f"tools ({len(names)}): {', '.join(names)}")
 
-            missing = EXPECTED_TOOLS - set(names)
-            if missing:
-                print(f"MISSING tools: {missing}", file=sys.stderr)
-                return 1
+        missing = EXPECTED_TOOLS - set(names)
+        if missing:
+            print(f"MISSING tools: {missing}", file=sys.stderr)
+            return 1
 
-            call = await session.call_tool("get_standings", {"competition": "PD"})
-            if not call.content:
-                print("get_standings returned empty content", file=sys.stderr)
-                return 1
+        call = await session.call_tool("get_standings", {"competition": "PD"})
+        if not call.content:
+            print("get_standings returned empty content", file=sys.stderr)
+            return 1
 
-            block = call.content[0]
-            text = getattr(block, "text", str(block))
-            print(f"\n--- get_standings(PD) ---\n{text[:500]}")
-            return 0
+        block = call.content[0]
+        text = getattr(block, "text", str(block))
+        print(f"\n--- get_standings(PD) ---\n{text[:500]}")
+        return 0
 
 
 if __name__ == "__main__":

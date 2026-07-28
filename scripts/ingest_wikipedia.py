@@ -9,8 +9,10 @@ Corpus (Phase 2 v1):
   cross-lingual retrieval quality.
 
 Chunking: RecursiveCharacterTextSplitter.from_tiktoken_encoder (cl100k_base),
-480 tokens per chunk + 64 token overlap. 480 (not 512) leaves headroom for
-the E5 "passage: " prefix under the 512-token truncation limit.
+480 tokens per chunk + 64 token overlap. 480 (not 512) leaves headroom under
+the model's 512-token truncation limit (originally sized for E5's "passage: "
+prefix; preserved for MiniLM per § 8.10 since re-chunking would require
+another full re-ingest for negligible gain).
 
 Run:
     uv run --env-file .env python scripts/ingest_wikipedia.py
