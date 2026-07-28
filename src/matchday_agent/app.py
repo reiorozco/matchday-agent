@@ -36,6 +36,7 @@ from starlette.status import HTTP_400_BAD_REQUEST, HTTP_429_TOO_MANY_REQUESTS, H
 
 from matchday_agent import __version__
 from matchday_agent.graph import build_agent
+from matchday_agent.rag.store import close_pool
 from matchday_agent.streaming import extract_chunk_text
 from matchday_agent.tools.mcp_tools import MissingCredentialError, matchday_mcp_tools
 from matchday_agent.tools.rag import search_football_context
@@ -196,6 +197,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     async with AsyncExitStack() as stack:
         checkpointer = await stack.enter_async_context(AsyncPostgresSaver.from_conn_string(dsn))
         await checkpointer.setup()
+        stack.push_async_callback(close_pool)
         try:
             mcp_tools = await stack.enter_async_context(matchday_mcp_tools())
         except MissingCredentialError as e:
@@ -209,7 +211,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
 
 
-limiter = Limiter(key_func=get_remote_address)
+def _client_ip(request: Request) -> str:
+    """Extract the real client IP for slowapi's per-user rate limiter.
+
+    Fly.io's edge proxy sets the `Fly-Client-IP` header with the true
+    origin IP. slowapi's default `get_remote_address` reads the socket
+    peer, which behind Fly is always the proxy's internal address — so
+    every request shares one bucket and a single burst blocks everyone
+    else (audit finding P1, decisions.md § 8.11). Fallback to the
+    default for local dev where the header is absent.
+    """
+    return request.headers.get("Fly-Client-IP") or get_remote_address(request)
+
+
+limiter = Limiter(key_func=_client_ip)
 
 app = FastAPI(
     lifespan=lifespan,

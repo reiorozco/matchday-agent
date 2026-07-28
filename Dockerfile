@@ -41,6 +41,13 @@ ENV PATH="/app/.venv/bin:${PATH}"
 COPY --chown=appuser:appuser pyproject.toml uv.lock ./
 RUN uv sync --no-dev --frozen --no-install-project
 
+# Pre-bake the fastembed RAG embedder model into the image so Fly cold
+# starts don't re-download ~220 MB of weights on the first RAG query.
+# Cached as its own layer — invalidated only when the embedder model
+# changes (rare). See decisions.md § 8.10 (audit response for the
+# original 2.24 GB OOM crash on the 512 MB VM).
+RUN /app/.venv/bin/python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')"
+
 # App source. `.dockerignore` excludes .env / .venv / .git / caches / docs —
 # see that file for the full exclusion list.
 COPY --chown=appuser:appuser . .

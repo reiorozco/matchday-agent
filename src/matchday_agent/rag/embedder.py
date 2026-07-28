@@ -1,12 +1,22 @@
 """Text embedding via fastembed (local ONNX, no API keys, no rate limits).
 
-Decision locked in docs/decisions.md § 2.x: intfloat/multilingual-e5-large
-(1024-dim, MIT, ~100 languages, 512-token truncation). fastembed's
-passage_embed / query_embed helpers auto-prepend the E5-required
-"passage: " / "query: " prefixes; we never inject them by hand.
+Model swap per decisions.md § 8.10 (audit response): the original
+intfloat/multilingual-e5-large (2.24 GB, 1024-dim) OOM-killed the
+512 MB Fly VM on first RAG call. fastembed's catalog does not include
+E5's smaller variants, so downgraded to
+sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 (~220 MB,
+384-dim, ~50 languages including EN+ES, Apache-2.0, 512-token
+truncation) — the smallest multilingual embedder fastembed supports.
+Fits comfortably in the 1 GB VM (bumped per § 8.10 too).
 
-The `TextEmbedding` instance is a process-wide singleton because the
-model file is 2.24 GB and loading it into ORT is expensive (~3-5 s).
+fastembed's passage_embed / query_embed helpers stay the same across
+models — for MiniLM they're aliases for the generic embed() call
+(no E5-style "passage: " / "query: " prefix needed).
+
+The `TextEmbedding` instance is a process-wide singleton — the smaller
+model loads in ~1-2 s. Pre-baked into the Docker image via a
+Dockerfile RUN step so cold starts don't re-download the ~220 MB
+weights.
 """
 
 from __future__ import annotations
@@ -15,8 +25,8 @@ from threading import Lock
 
 from fastembed import TextEmbedding
 
-_MODEL_NAME = "intfloat/multilingual-e5-large"
-EMBEDDING_DIM = 1024
+_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBEDDING_DIM = 384
 
 _model: TextEmbedding | None = None
 _model_lock = Lock()

@@ -46,9 +46,7 @@ MAX_CONCURRENCY = 2
 BASELINE_PATH = Path("evals/baseline.md")
 
 
-def _ensure_dataset(
-    client: Client, examples: list[dict[str, Any]], dataset_name: str
-) -> str:
+def _ensure_dataset(client: Client, examples: list[dict[str, Any]], dataset_name: str) -> str:
     """Read the dataset if it exists, else create it and upload examples.
 
     Uses a stable name so re-runs across days build on the same dataset

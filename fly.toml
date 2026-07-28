@@ -25,11 +25,11 @@ primary_region = 'iad'
   # (or a `fly secrets set` override) + redeploy — no code change per § 3.6.
   LLM_PROVIDER = 'groq'
   LLM_MODEL = 'llama-3.3-70b-versatile'
-  # Defensive stop-gap per decisions.md § 8.9 audit response: the 2.24 GB
-  # multilingual-e5-large embedder OOM-kills the 512 MB VM on first RAG
-  # call. Set to 'true' after § 8.10 model swap (multilingual-e5-small,
-  # 470 MB) + VM bump to 1 GB + fresh ingest complete.
-  RAG_ENABLED = 'false'
+  # RAG re-enabled after § 8.10 model swap complete: embedder is now
+  # paraphrase-multilingual-MiniLM-L12-v2 (~220 MB, 384-dim) pre-baked
+  # into the image, corpus re-ingested in Supabase with the new dim,
+  # HNSW rebuilt with vector_cosine_ops. VM bumped to 1 GB (see [[vm]]).
+  RAG_ENABLED = 'true'
 
 [http_service]
   internal_port = 8080
@@ -57,5 +57,9 @@ primary_region = 'iad'
 
 [[vm]]
   size = 'shared-cpu-1x'
-  memory = '512mb'                # Bump to `1gb` if Node subprocess +
-                                  # pgvector queries pressure it (revisit Phase 5).
+  memory = '1gb'                  # Bumped from 512 MB per decisions.md § 8.10
+                                  # audit response: paraphrase-multilingual-MiniLM-L12-v2
+                                  # embedder (~220 MB in ORT) + Python runtime
+                                  # + Node MCP subprocess + pgvector queries
+                                  # need headroom. Original 512 MB OOM-killed
+                                  # the first RAG call (§ 8.9 diagnosis).

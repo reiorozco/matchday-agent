@@ -166,7 +166,7 @@ async def _ingest_language_pass(titles: list[str], lang: str) -> int:
         return 0
 
     print(
-        f"\n=== Embed {len(chunks)} chunks (intfloat/multilingual-e5-large, 1024d) ===",
+        f"\n=== Embed {len(chunks)} chunks (paraphrase-multilingual-MiniLM-L12-v2, 384d) ===",
         flush=True,
     )
     texts = [c["content"] for c in chunks]
