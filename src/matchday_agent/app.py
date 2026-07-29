@@ -22,8 +22,9 @@ from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, cast
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
 from groq import RateLimitError as GroqRateLimitError
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, ToolMessage
@@ -37,6 +38,7 @@ from starlette.status import HTTP_400_BAD_REQUEST, HTTP_429_TOO_MANY_REQUESTS, H
 
 from matchday_agent import __version__
 from matchday_agent.graph import build_agent
+from matchday_agent.landing import render_landing
 from matchday_agent.rag.store import close_pool
 from matchday_agent.streaming import extract_chunk_text
 from matchday_agent.tools.mcp_tools import MissingCredentialError, matchday_mcp_tools
@@ -286,13 +288,28 @@ app.add_middleware(
 
 
 @app.get("/")
-async def root(request: Request) -> dict[str, Any]:
-    return {
+async def root(request: Request) -> Response:
+    """Content-negotiated index.
+
+    Browsers (``Accept: text/html``) get a landing page pointing at the live
+    chat demo; API clients (curl / ``*/*`` / ``application/json``) keep the
+    machine-readable JSON contract. See ``docs/decisions.md`` § 8.13.
+    """
+    meta: dict[str, Any] = {
         "name": "matchday-agent",
         "version": __version__,
         "model": request.app.state.model_id,
         "tools": request.app.state.tool_names,
     }
+    if "text/html" in request.headers.get("accept", ""):
+        return HTMLResponse(
+            render_landing(
+                version=meta["version"],
+                model=meta["model"],
+                tools=meta["tools"],
+            )
+        )
+    return JSONResponse(meta)
 
 
 @app.get("/health")

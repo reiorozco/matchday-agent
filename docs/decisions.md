@@ -2722,3 +2722,37 @@ pass was cosmetic but portfolio-visible — reviewers reading
 sloppy". Ship the small fixes with the flagship (audit response)
 because they're literally 30 LOC each. Same pattern as § 8.6.
 
+
+---
+
+## 8.13 — Root landing page for browsers (content-negotiated `/`)
+
+**Trigger**: a recruiter clicking the live URL `https://matchday-agent.fly.dev`
+landed on the raw JSON index (`{name, version, model, tools}`). For an
+engineer that's a fine machine-readable index; for a non-engineer it reads as
+"is this broken?" — zero interaction, no path to the actual demo (the chat).
+
+**Fix**: content-negotiate the root route on the `Accept` header.
+
+- `Accept: text/html` (browsers) → a self-contained HTML **landing** with a
+  primary CTA **"Try the live chat →"** pointing at the SvelteKit chat surface
+  (`https://matchday-mcp-web.vercel.app/chat`, overridable via `CHAT_DEMO_URL`
+  env), the 7 bound tools as chips, model/version, a GitHub source link, and an
+  honest ~20s cold-start note so the wait doesn't read as a hang.
+- `curl` / `Accept: */*` / `application/json` (API clients) → the **same JSON
+  contract as before**, unchanged. The README's `curl / | jq` example still
+  works (curl sends `*/*`, so it never sees the HTML).
+
+**Placement**: HTML template lives in `src/matchday_agent/landing.py`
+(`render_landing()`, placeholder-substituted so inline CSS braces need no
+escaping; `# ruff: noqa: E501` because the template lines are intentionally
+long). `app.py`'s root handler switches on `"text/html" in Accept` and returns
+`HTMLResponse` vs `JSONResponse`.
+
+**Why a separate page and not just prettier JSON**: the demo that impresses is
+the streaming chat, which lives in a different repo (`matchday-mcp-web`). The
+agent's own URL should route humans there rather than trying to be a UI itself.
+
+**Deploy note**: per § 8.1, `fly secrets set` does NOT rebuild — this needs a
+`flyctl deploy`, then a live probe (browser sees the landing; `curl | jq` still
+returns JSON). Fourth+ application of § 8.6 (live-probe = phase-close signal).
