@@ -233,12 +233,15 @@ the same pooler host:
 `aws-0-<REGION>.pooler.supabase.com`, username `postgres.<REF>`.
 Append `?sslmode=require` (Supabase enforces TLS).
 
-For the concrete `matchday-dev` project (ref `vdggittczhvvszguqxez`,
-region `ca-central-1`):
+For the concrete `matchday-dev` project (see § 0.7 for the captured
+project metadata — ref, region, project URL):
 
 ```
-postgresql://postgres.vdggittczhvvszguqxez:<PASSWORD>@aws-0-ca-central-1.pooler.supabase.com:5432/postgres?sslmode=require
+postgresql://postgres.<PROJECT_REF>:<PASSWORD>@aws-0-<REGION>.pooler.supabase.com:5432/postgres?sslmode=require
 ```
+
+(Placeholders used to avoid GitGuardian false positives on the full
+`postgresql://user:pass@host` pattern — see § 8.14.)
 
 Password lives in `.env` locally and in `fly secrets set` in prod.
 Verify the exact host once against the dashboard's "Get Connected →
@@ -306,7 +309,7 @@ fly secrets set \
   GROQ_API_KEY="..." \
   LANGSMITH_API_KEY="..." \
   LANGSMITH_PROJECT="matchday-agent" \
-  DATABASE_URL="postgresql://postgres.vdggittczhvvszguqxez:<PASS>@aws-0-ca-central-1.pooler.supabase.com:5432/postgres?sslmode=require" \
+  DATABASE_URL="postgresql://postgres.<PROJECT_REF>:<PASS>@aws-0-<REGION>.pooler.supabase.com:5432/postgres?sslmode=require" \
   FOOTBALL_DATA_TOKEN="..." \
   ALLOWED_ORIGINS="https://matchday-mcp-web.vercel.app"
 ```
@@ -2756,3 +2759,118 @@ agent's own URL should route humans there rather than trying to be a UI itself.
 **Deploy note**: per § 8.1, `fly secrets set` does NOT rebuild — this needs a
 `flyctl deploy`, then a live probe (browser sees the landing; `curl | jq` still
 returns JSON). Fourth+ application of § 8.6 (live-probe = phase-close signal).
+
+---
+
+## 8.14 — Supabase RLS enabled (defense-in-depth) + GitGuardian false positive
+
+**Two related alerts arrived on the same audit pass (2026-07-26 → 2026-07-29):**
+
+### 8.14.a — Supabase security advisor: `rls_disabled_in_public` (CRITICAL)
+
+**Trigger**: Supabase email flagged 5 tables in `public` schema as fully
+exposed to the anon publishable key: `checkpoint_migrations`, `checkpoints`,
+`checkpoint_blobs`, `checkpoint_writes`, `documents`. This was noted as a
+follow-up in § 8.11 and now closed here.
+
+**Actual exposure (pre-fix)**:
+- Backend uses `DATABASE_URL` with the `postgres` role → **bypasses RLS**
+  (postgres role has `BYPASSRLS` attribute by default in Supabase).
+- Frontend (`matchday-mcp-web`, Svelte 5 on Vercel) consumes SSE from the
+  Fly.io backend — **never touches Supabase directly**, no anon key wired.
+- Codebase search confirmed: no `SUPABASE_ANON_KEY` / `SUPABASE_SERVICE_ROLE_KEY`
+  in `.env.example`, no `@supabase/supabase-js` in `pyproject.toml`.
+
+So current-usage risk = 0. But the anon publishable key is trivially
+retrievable from the Supabase dashboard, and if ever exposed to a client
+(future dashboard, wrong config), an attacker could read/delete 5 000+ rows
+of conversation history + RAG corpus.
+
+**Fix** (defense-in-depth, zero code change):
+
+```sql
+-- Enable RLS on all 5 tables.
+ALTER TABLE public.checkpoint_migrations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.checkpoints           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.checkpoint_blobs      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.checkpoint_writes     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.documents             ENABLE ROW LEVEL SECURITY;
+
+-- service_role FOR ALL: future-proof if we ever wire the Supabase SDK
+-- server-side. postgres role bypasses regardless.
+CREATE POLICY "service_role_full_access" ON public.<table>
+  FOR ALL TO service_role USING (true) WITH CHECK (true);
+```
+
+**Why service_role policies AND postgres bypass?**
+
+Both act as safety nets from different angles:
+- `postgres` role bypasses RLS entirely → backend keeps working with no code
+  or credential rotation needed.
+- `service_role` policy explicitly grants access → if we ever migrate off
+  raw psycopg to `supabase-py` (which uses `service_role`), no policy change
+  is needed.
+- `anon` and `authenticated` roles have NO policy → blocked from all
+  operations. Attempted access returns empty rowsets (SELECT) or a policy
+  violation error (INSERT/UPDATE/DELETE).
+
+**Applied**: 2026-07-29 via `.venv/bin/python` + `psycopg` against
+`DATABASE_URL` (Supabase MCP still `read_only=true` in `.mcp.json`, so
+`apply_migration` MCP tool was unusable — same fallback pattern as § 8.10).
+Migration file recorded at [`db/migrations/001_enable_rls_public_tables.sql`](../db/migrations/001_enable_rls_public_tables.sql).
+
+**Verification**:
+```sql
+SELECT t.tablename, t.rowsecurity, COUNT(p.policyname)
+FROM pg_tables t
+LEFT JOIN pg_policies p ON p.schemaname=t.schemaname AND p.tablename=t.tablename
+WHERE t.schemaname='public'
+GROUP BY t.tablename, t.rowsecurity;
+```
+Result: all 5 tables `rowsecurity=true`, 1 policy each named
+`service_role_full_access`. Row counts unchanged (763 / 1 046 / 2 027 /
+2 399), confirming the `postgres` role still round-trips through as
+expected.
+
+### 8.14.b — GitGuardian: `PostgreSQL Credentials` on commit `6d19740`
+
+**Trigger**: GitGuardian scanned the initial Phase 0 commit and flagged
+`PostgreSQL Credentials`, pointing at `.env.example`, `docs/decisions.md`,
+and `README.md`.
+
+**Root cause**: **False positive**. Every DSN in the repo used
+`<PASSWORD>` / `<PASS>` as literal placeholders — no real credentials were
+ever committed (`.env` is `.gitignore`d on line 18). GitGuardian's regex
+matches the shape
+`postgresql://<user>:<anything>@<host>:<port>/<db>` and does not always
+recognize angle-bracket placeholders as non-secrets, especially when the
+username segment is a real-looking Supabase project ref
+(`postgres.<PROJECT_REF>`).
+
+**Mitigation** (prevent future false positives without hiding public info):
+
+1. Replaced full-DSN patterns in `.env.example`, `docs/decisions.md` with
+   `<PROJECT_REF>` / `<REGION>` placeholders. Breaks the regex shape while
+   keeping the examples readable.
+2. Kept `<PROJECT_REF>` documented in the § 0.7 project-metadata table (real
+   value there) because that's the source of truth for future onboarding —
+   the ref is public info (baked into `.mcp.json` and the Supabase project
+   URL), not a secret.
+3. `.mcp.json` still contains the real ref in the MCP URL
+   (`?project_ref=...&read_only=true`) — required for the MCP integration
+   to resolve, and not a Postgres DSN pattern so it doesn't trip GG.
+
+**Password rotation status**: NOT rotated. Justification:
+- No real password ever left the local `.env` / `fly secrets` (only
+  placeholders committed).
+- The current password remains valid for both `.env` local dev and Fly.io
+  prod runtime.
+- If any future GG hit is a true positive rather than a shape match on
+  placeholders, rotation would be the correct response.
+
+**GitGuardian action**: mark incident on commit `6d19740` as
+`false_positive` with reason "placeholder in documentation". Future scans
+against the placeholders introduced by this pass will not re-trigger.
+
+**Related**: § 8.11 (original RLS observation, now closed). Same pattern as
+§ 8.10 (MCP read-only forces psycopg fallback for DDL).
